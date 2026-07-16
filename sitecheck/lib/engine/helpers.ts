@@ -1,0 +1,308 @@
+// lib/engine/helpers.ts — Shared navigation helpers for pillar checks
+import type { Page } from 'playwright';
+
+/**
+ * Navigate to a URL and wait for the page to fully render.
+ * Uses networkidle with fallback to domcontentloaded, plus a stabilization delay.
+ */
+export async function navigateAndWait(
+  page: Page,
+  url: string,
+  options?: { timeout?: number; waitAfter?: number }
+): Promise<void> {
+  const timeout = options?.timeout ?? 30000;
+  const waitAfter = options?.waitAfter ?? 3000;
+
+  try {
+    await page.goto(url, { waitUntil: 'networkidle', timeout });
+  } catch {
+    // Fallback to domcontentloaded if networkidle times out
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    } catch {
+      // Last resort — just commit
+      await page.goto(url, { waitUntil: 'commit', timeout: 10000 });
+    }
+  }
+
+  // Extra stabilization for JS-rendered SPAs
+  await page.waitForTimeout(waitAfter);
+}
+
+/**
+ * Take a screenshot after ensuring the page content is visible.
+ * Waits for body to be non-empty and a short stabilization period.
+ */
+export async function takeScreenshot(
+  page: Page,
+  absPath: string,
+  options?: { fullPage?: boolean }
+): Promise<void> {
+  // Wait briefly for any pending renders
+  await page.waitForTimeout(1000);
+  await page.screenshot({ path: absPath, fullPage: options?.fullPage ?? false });
+}
+
+/**
+ * Try to capture a screenshot of the first matching element from a list of selectors.
+ * Falls back to a normal page screenshot when no element match is found.
+ * NOTE: Prefer takeHighlightedScreenshot where full context is needed.
+ */
+export async function takeElementScreenshot(
+  page: Page,
+  absPath: string,
+  selectors: string[],
+  options?: { fallbackFullPage?: boolean; padding?: number }
+): Promise<boolean> {
+  await page.waitForTimeout(1000);
+  const padding = Math.max(10, Math.min(options?.padding ?? 24, 50));
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if ((await locator.count()) > 0) {
+      try {
+        await locator.scrollIntoViewIfNeeded();
+        const box = await locator.boundingBox();
+        if (box) {
+          const viewport = page.viewportSize();
+          const clip = {
+            x: Math.max(0, box.x - padding),
+            y: Math.max(0, box.y - padding),
+            width: Math.max(1, box.width + padding * 2),
+            height: Math.max(1, box.height + padding * 2),
+          };
+
+          if (viewport) {
+            clip.width = Math.min(clip.width, viewport.width - clip.x);
+            clip.height = Math.min(clip.height, viewport.height - clip.y);
+          }
+
+          await page.screenshot({ path: absPath, clip });
+          return true;
+        }
+
+        await locator.screenshot({ path: absPath });
+        return true;
+      } catch {
+        // Try the next selector.
+      }
+    }
+  }
+
+  await page.screenshot({ path: absPath, fullPage: options?.fallbackFullPage ?? false });
+  return false;
+}
+
+/**
+ * Dismiss cookie consent banners so they don't cover evidence screenshots.
+ * Tries clicking common accept/decline buttons first, then hides any
+ * remaining overlay elements. Best-effort — never throws.
+ */
+export async function dismissCookieBanner(page: Page): Promise<void> {
+  try {
+    const cookieButtonSelectors = [
+      'button:has-text("Accept All")', 'button:has-text("Accept all")',
+      'button:has-text("ACCEPT ALL COOKIES")', 'button:has-text("Accept all cookies")',
+      'button:has-text("Accept Cookies")', 'button:has-text("Accept cookies")',
+      'button:has-text("Accept")',
+      'button:has-text("Allow All")', 'button:has-text("Allow all")',
+      'button:has-text("Agree")', 'button:has-text("I agree")',
+      'button:has-text("Got it")', 'button:has-text("OK")',
+      'button:has-text("Decline")', 'button:has-text("Decline Cookies")',
+      'button:has-text("DECLINE COOKIES")',
+      'button:has-text("Reject All")', 'button:has-text("Reject all")',
+      'button:has-text("موافق")', 'button:has-text("قبول")',
+      'a:has-text("Accept All")', 'a:has-text("Accept all cookies")',
+      '[id*="cookie"] button', '[class*="cookie"] button',
+      '[id*="consent"] button', '[class*="consent"] button',
+      '[id*="gdpr"] button', '[class*="gdpr"] button',
+      '#onetrust-accept-btn-handler', '.onetrust-close-btn-handler',
+      '[data-testid="cookie-accept"]', '[data-testid="accept-cookies"]',
+    ];
+
+    for (const sel of cookieButtonSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 500 })) {
+          await btn.click({ timeout: 1000 });
+          console.log(`[SiteCheck] Dismissed cookie banner via: ${sel}`);
+          await page.waitForTimeout(1000);
+          return;
+        }
+      } catch { /* try next */ }
+    }
+
+    // Fallback: hide cookie overlay elements that are still visible
+    await page.evaluate(() => {
+      const overlaySelectors = [
+        '[id*="cookie"]', '[class*="cookie-banner"]', '[class*="cookie-consent"]',
+        '[class*="cookie-notice"]', '[class*="cookie-popup"]', '[class*="cookie-overlay"]',
+        '[class*="cookie-bar"]', '[class*="cookiebar"]',
+        '[id*="consent"]', '[class*="consent-banner"]', '[class*="consent-modal"]',
+        '[id*="gdpr"]', '[class*="gdpr"]',
+        '#onetrust-banner-sdk', '#onetrust-consent-sdk',
+        '[class*="CookieConsent"]', '[class*="cookieConsent"]',
+      ];
+      for (const sel of overlaySelectors) {
+        try {
+          const els = document.querySelectorAll(sel);
+          for (const el of els) {
+            const rect = (el as HTMLElement).getBoundingClientRect();
+            if (rect.width > 100 && rect.height > 50) {
+              (el as HTMLElement).style.display = 'none';
+            }
+          }
+        } catch { /* */ }
+      }
+    });
+  } catch {
+    // Cookie dismissal is best-effort
+  }
+}
+
+/**
+ * Capture a full-page or large-viewport screenshot with a visible red highlight box
+ * around the target element. Does NOT crop the image, ensuring surrounding context
+ * (like headers and layout) is preserved.
+ */
+export async function takeHighlightedScreenshot(
+  page: Page,
+  absPath: string,
+  selectors: string[],
+  options?: { fullPage?: boolean; label?: string; contextualZoom?: boolean; maxHighlightBox?: { width: number, height: number } }
+): Promise<boolean> {
+  await page.waitForTimeout(1000);
+  let highlighted = false;
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if ((await locator.count()) > 0 && await locator.isVisible()) {
+      try {
+        const box = await locator.boundingBox();
+        
+        // Skip elements that are too large (e.g. full page wrappers or generic headers)
+        if (box && options?.maxHighlightBox) {
+          if (box.width > options.maxHighlightBox.width || box.height > options.maxHighlightBox.height) {
+            continue; // Try next selector
+          }
+        }
+
+        await locator.scrollIntoViewIfNeeded();
+        
+        // Inject a visible highlight using evaluation
+        await locator.evaluate((el: Element, labelText?: string) => {
+          const htmlEl = el as HTMLElement;
+          htmlEl.dataset.origOutline = htmlEl.style.outline;
+          htmlEl.dataset.origOutlineOffset = htmlEl.style.outlineOffset;
+          htmlEl.dataset.origBoxShadow = htmlEl.style.boxShadow;
+          
+          htmlEl.style.outline = '4px solid red';
+          htmlEl.style.outlineOffset = '2px';
+          htmlEl.style.boxShadow = '0 0 15px rgba(255, 0, 0, 0.5)';
+          htmlEl.style.transition = 'none'; // Ensure instant apply
+          
+          if (labelText) {
+            const labelEl = document.createElement('div');
+            labelEl.textContent = labelText;
+            labelEl.style.position = 'absolute';
+            labelEl.style.backgroundColor = 'red';
+            labelEl.style.color = 'white';
+            labelEl.style.padding = '4px 8px';
+            labelEl.style.fontSize = '14px';
+            labelEl.style.fontWeight = 'bold';
+            labelEl.style.borderRadius = '4px';
+            labelEl.style.zIndex = '999999';
+            labelEl.style.pointerEvents = 'none';
+            
+            labelEl.id = 'sitecheck-highlight-label';
+            document.body.appendChild(labelEl);
+
+            const rect = htmlEl.getBoundingClientRect();
+            const labelRect = labelEl.getBoundingClientRect();
+            
+            // Try placing above the element
+            let top = rect.top + window.scrollY - labelRect.height - 8;
+            let left = rect.left + window.scrollX;
+            
+            // If there's not enough space above, place it below the element
+            if (rect.top < labelRect.height + 10) {
+              top = rect.bottom + window.scrollY + 8;
+            }
+            
+            // Prevent clipping on the right edge
+            if (rect.left + labelRect.width > window.innerWidth) {
+              left = window.innerWidth + window.scrollX - labelRect.width - 8;
+            }
+            
+            // Prevent clipping on the left edge
+            if (rect.left < 0) {
+              left = window.scrollX + 8;
+            }
+            
+            labelEl.style.top = `${top}px`;
+            labelEl.style.left = `${left}px`;
+          }
+        }, options?.label);
+        
+        await page.waitForTimeout(500);
+
+        let clip = undefined;
+        let useFullPage = options?.fullPage ?? false;
+
+        // If contextualZoom is true, capture the full width of the screen but limit height
+        // to show the element with some vertical context (e.g., the header).
+        if (options?.contextualZoom) {
+          const box = await locator.boundingBox();
+          const viewport = page.viewportSize();
+          if (box && viewport) {
+            useFullPage = false; // mutually exclusive with clip
+            const paddingVertical = 150;
+            const yStart = Math.max(0, box.y - paddingVertical);
+            const neededHeight = (box.y - yStart) + box.height + paddingVertical;
+            clip = {
+              x: 0,
+              y: yStart,
+              width: viewport.width,
+              height: Math.min(viewport.height, Math.max(neededHeight, 350))
+            };
+          }
+        }
+        
+        await page.screenshot({ path: absPath, fullPage: useFullPage, clip });
+        
+        // Cleanup label if it was added
+        if (options?.label) {
+          await page.evaluate(() => {
+            const label = document.getElementById('sitecheck-highlight-label');
+            if (label) label.remove();
+          });
+        }
+        
+        highlighted = true;
+        return true;
+      } catch {
+        // Try next selector on failure
+      }
+    }
+  }
+
+  // Fallback if no element could be highlighted
+  if (!highlighted) {
+    let clip = undefined;
+    let useFullPage = options?.fullPage ?? false;
+    if (options?.contextualZoom) {
+      const viewport = page.viewportSize();
+      if (viewport) {
+        useFullPage = false;
+        clip = {
+          x: 0,
+          y: 0,
+          width: viewport.width,
+          height: Math.min(viewport.height, 400)
+        };
+      }
+    }
+    await page.screenshot({ path: absPath, fullPage: useFullPage, clip });
+  }
+  return false;
+}

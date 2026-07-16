@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id        String     @id @default(cuid())
+  email     String     @unique
+  password  String
+  name      String
+  createdAt DateTime   @default(now())
+  audits    AuditJob[]
+}
+
+model AuditJob {
+  id                String            @id @default(cuid())
+  userId            String
+  user              User              @relation(fields: [userId], references: [id])
+  websiteUrl        String
+  entityName        String
+  serviceName       String            @default("")
+  evaluatorLanguage String            @default("en")
+  deviceType        String            @default("desktop")
+  status            String            @default("pending")
+  totalScore        Float             @default(0)
+  maxScore          Float             @default(118)
+  percentage        Float             @default(0)
+  grade             String            @default("")
+  createdAt         DateTime          @default(now())
+  results           CriterionResult[]
+  pdfReports        PdfReport[]
+}
+
+model CriterionResult {
+  id              String   @id @default(cuid())
+  auditJobId      String
+  auditJob        AuditJob @relation(fields: [auditJobId], references: [id], onDelete: Cascade)
+  qid             String
+  criterionNameEN String
+  criterionNameAR String
+  pillar          String
+  subPillar       String   @default("")
+  scoreEarned     Float
+  maxScore        Float
+  status          String
+  screenshotPath  String   @default("")
+  videoPath       String   @default("") // per-pillar screen recording (.webm), shared by the pillar's criteria
+  notes           String   @default("")
+  recommendation  String   @default("")
+  isAutomatic     Boolean  @default(true)
+  checkType       String   @default("auto") // auto | manual | openended
+  dependsOn       String   @default("") // Parent QID if conditional
+}
+
+// A submitted enquiry awaiting an async email reply. The background poller
+// (scripts/poll-enquiries.ts) watches `inbox` over IMAP until a reply arrives
+// or `deadlineAt` passes, then grades Q56–Q66 and marks this resolved.
+model PendingEnquiry {
+  id           String   @id @default(cuid())
+  auditJobId   String
+  inbox        String
+  entityDomain String   @default("")
+  language     String   @default("en")
+  sentSubject  String   @default("")
+  submittedAt  DateTime @default(now())
+  deadlineAt   DateTime
+  resolved     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+}
+
+model PdfReport {
+  id          String   @id @default(cuid())
+  auditJobId  String
+  auditJob    AuditJob @relation(fields: [auditJobId], references: [id], onDelete: Cascade)
+  filePath    String
+  generatedAt DateTime @default(now())
+}
