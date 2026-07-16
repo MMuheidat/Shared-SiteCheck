@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { Eye, ArrowUpDown, Image as ImageIcon, Video } from 'lucide-react';
 import type { CriterionResult } from '@/lib/types';
 import { getCriterion } from '@/lib/scoring';
@@ -34,6 +34,27 @@ function statusLabel(status: string): string {
 
 type SortKey = 'qid' | 'pillar' | 'status' | 'score';
 
+function SortHeader({
+  label,
+  col,
+  sortKey,
+  onSort,
+}: {
+  label: string;
+  col: SortKey;
+  sortKey: SortKey;
+  onSort: (key: SortKey) => void;
+}) {
+  return (
+    <th className="cursor-pointer select-none group" onClick={() => onSort(col)}>
+      <div className="flex items-center gap-1">
+        {label}
+        <ArrowUpDown className={`w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity ${sortKey === col ? '!opacity-100 text-primary' : ''}`} />
+      </div>
+    </th>
+  );
+}
+
 function getCriterionSubtitle(qid: string): string {
   const criterion = getCriterion(qid);
   const description = criterion?.nameEN ?? '';
@@ -52,6 +73,16 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
       setSortAsc(true);
     }
   };
+
+  // One screen-recording per pillar (every row of a recorded pillar carries the
+  // same videoPath) — surfaced as a single "Show Video" bar under the pillar's rows.
+  const pillarVideos = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const r of results) {
+      if (r.videoPath && !map.has(r.pillar)) map.set(r.pillar, r.videoPath);
+    }
+    return map;
+  }, [results]);
 
   const sortedResults = useMemo(() => {
     const sorted = [...results].sort((a, b) => {
@@ -75,35 +106,30 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
     return sorted;
   }, [results, sortKey, sortAsc]);
 
-  const SortHeader = ({ label, col }: { label: string; col: SortKey }) => (
-    <th
-      className="cursor-pointer select-none group"
-      onClick={() => handleSort(col)}
-    >
-      <div className="flex items-center gap-1">
-        {label}
-        <ArrowUpDown className={`w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity ${sortKey === col ? '!opacity-100 text-primary' : ''}`} />
-      </div>
-    </th>
-  );
-
   return (
     <div className="table-container animate-fade-in">
       <table>
         <thead>
           <tr>
-            <SortHeader label="QID" col="qid" />
+            <SortHeader label="QID" col="qid" sortKey={sortKey} onSort={handleSort} />
             <th>Criterion</th>
             <th>Technical Notes</th>
-            <SortHeader label="Pillar" col="pillar" />
-            <SortHeader label="Score" col="score" />
-            <SortHeader label="Status" col="status" />
+            <SortHeader label="Pillar" col="pillar" sortKey={sortKey} onSort={handleSort} />
+            <SortHeader label="Score" col="score" sortKey={sortKey} onSort={handleSort} />
+            <SortHeader label="Status" col="status" sortKey={sortKey} onSort={handleSort} />
             <th>Evidence</th>
           </tr>
         </thead>
         <tbody>
-          {sortedResults.map((r) => (
-            <tr key={r.qid}>
+          {sortedResults.map((r, i) => {
+            // End of a contiguous pillar run → append that pillar's video bar
+            const isPillarGroupEnd =
+              i === sortedResults.length - 1 || sortedResults[i + 1].pillar !== r.pillar;
+            const pillarVideo = isPillarGroupEnd ? pillarVideos.get(r.pillar) : undefined;
+
+            return (
+            <React.Fragment key={r.qid}>
+            <tr>
               <td>
                 <span className="font-mono text-xs text-text-secondary">{r.qid}</span>
               </td>
@@ -136,27 +162,14 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
                 </span>
               </td>
               <td>
-                {r.screenshotPath || r.videoPath ? (
-                  <div className="flex flex-col gap-1">
-                    {r.videoPath && (
-                      <button
-                        onClick={() => onScreenshotClick(r.videoPath!, r.criterionNameEN)}
-                        className="flex items-center gap-1.5 text-primary hover:text-primary-dark transition-colors group"
-                      >
-                        <Video className="w-4 h-4" />
-                        <span className="text-xs group-hover:underline">Video</span>
-                      </button>
-                    )}
-                    {r.screenshotPath && (
-                      <button
-                        onClick={() => onScreenshotClick(r.screenshotPath!, r.criterionNameEN)}
-                        className="flex items-center gap-1.5 text-primary hover:text-primary-dark transition-colors group"
-                      >
-                        <Eye className="w-4 h-4" />
-                        <span className="text-xs group-hover:underline">View</span>
-                      </button>
-                    )}
-                  </div>
+                {r.screenshotPath ? (
+                  <button
+                    onClick={() => onScreenshotClick(r.screenshotPath!, r.criterionNameEN)}
+                    className="flex items-center gap-1.5 text-primary hover:text-primary-dark transition-colors group"
+                  >
+                    <Eye className="w-4 h-4" />
+                    <span className="text-xs group-hover:underline">View</span>
+                  </button>
                 ) : (
                   <span className="flex items-center gap-1 text-text-muted">
                     <ImageIcon className="w-4 h-4 opacity-30" />
@@ -165,7 +178,22 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
                 )}
               </td>
             </tr>
-          ))}
+            {pillarVideo && (
+              <tr>
+                <td colSpan={7} className="!py-2">
+                  <button
+                    onClick={() => onScreenshotClick(pillarVideo, `${r.pillar} — Screen Recording`)}
+                    className="w-full text-xs py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 transition-all duration-200 bg-primary text-white hover:bg-primary-dark shadow-sm"
+                  >
+                    <Video className="w-3.5 h-3.5" />
+                    Show Video
+                  </button>
+                </td>
+              </tr>
+            )}
+            </React.Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>

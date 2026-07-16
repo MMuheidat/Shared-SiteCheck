@@ -36,10 +36,10 @@ export async function navigateAndWait(
 export async function takeScreenshot(
   page: Page,
   absPath: string,
-  options?: { fullPage?: boolean }
+  options?: { fullPage?: boolean; waitMs?: number }
 ): Promise<void> {
   // Wait briefly for any pending renders
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(options?.waitMs ?? 1000);
   await page.screenshot({ path: absPath, fullPage: options?.fullPage ?? false });
 }
 
@@ -161,6 +161,123 @@ export async function dismissCookieBanner(page: Page): Promise<void> {
 }
 
 /**
+ * Capture a screenshot with a DRAWN red rectangle (fixed-position overlay div)
+ * around the target element, plus an optional red label pill above it.
+ *
+ * Unlike takeHighlightedScreenshot (which styles the element's own outline and
+ * can be defeated by site CSS or hug a tiny inline anchor), the overlay box is
+ * always visible and — with `containerize` — wraps the element's whole result
+ * card, not just the link text. The overlay is removed after the shot (it is
+ * position:fixed and must not survive later scrolling).
+ *
+ * Returns true if a box was drawn, false if it fell back to a plain screenshot.
+ */
+export async function takeBoxedScreenshot(
+  page: Page,
+  absPath: string,
+  selectors: string[],
+  options?: { label?: string; containerize?: boolean; padding?: number; waitMs?: number }
+): Promise<boolean> {
+  const padding = options?.padding ?? 8;
+  await page.waitForTimeout(options?.waitMs ?? 400);
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    try {
+      if ((await locator.count()) === 0 || !(await locator.isVisible())) continue;
+      await locator.scrollIntoViewIfNeeded();
+
+      const drawn = await locator.evaluate(
+        (el: Element, args: { label?: string; containerize?: boolean; padding: number }) => {
+          // Optionally climb to the ancestor that represents the whole result card
+          let target: Element = el;
+          if (args.containerize) {
+            const vh = window.innerHeight;
+            let current: Element | null = el;
+            while (current && current !== document.body) {
+              const r = current.getBoundingClientRect();
+              if (r.width >= 350 && r.height >= 50) {
+                if (r.height > vh * 0.6) break; // too big — keep the previous target
+                target = current;
+                break;
+              }
+              current = current.parentElement;
+            }
+          }
+
+          const rect = target.getBoundingClientRect();
+          if (rect.width < 2 || rect.height < 2) return false;
+
+          const box = document.createElement('div');
+          box.id = '__sitecheck_box';
+          box.style.cssText = [
+            'position: fixed',
+            `left: ${rect.left - args.padding}px`,
+            `top: ${rect.top - args.padding}px`,
+            `width: ${rect.width + args.padding * 2}px`,
+            `height: ${rect.height + args.padding * 2}px`,
+            'border: 4px solid red',
+            'border-radius: 6px',
+            'box-shadow: 0 0 15px rgba(255, 0, 0, 0.5)',
+            'pointer-events: none',
+            'z-index: 2147483647',
+          ].join(';');
+          document.body.appendChild(box);
+
+          if (args.label) {
+            const pill = document.createElement('div');
+            pill.id = '__sitecheck_box_label';
+            pill.textContent = args.label;
+            pill.style.cssText = [
+              'position: fixed',
+              'background: red',
+              'color: white',
+              'padding: 4px 10px',
+              'font: bold 14px/1.3 Arial, sans-serif',
+              'border-radius: 4px',
+              'pointer-events: none',
+              'z-index: 2147483647',
+              'white-space: nowrap',
+            ].join(';');
+            document.body.appendChild(pill);
+            const pillRect = pill.getBoundingClientRect();
+            // Above the box; below it when there is no room
+            let top = rect.top - args.padding - pillRect.height - 6;
+            if (top < 4) top = rect.bottom + args.padding + 6;
+            let left = rect.left - args.padding;
+            if (left + pillRect.width > window.innerWidth - 8) {
+              left = window.innerWidth - pillRect.width - 8;
+            }
+            if (left < 4) left = 4;
+            pill.style.top = `${top}px`;
+            pill.style.left = `${left}px`;
+          }
+          return true;
+        },
+        { label: options?.label, containerize: options?.containerize, padding },
+      );
+
+      if (!drawn) continue;
+
+      await page.waitForTimeout(400); // visible on the recording
+      await page.screenshot({ path: absPath });
+
+      await page.evaluate(() => {
+        document.getElementById('__sitecheck_box')?.remove();
+        document.getElementById('__sitecheck_box_label')?.remove();
+      }).catch(() => { /* page may have navigated */ });
+
+      return true;
+    } catch {
+      // Try the next selector.
+    }
+  }
+
+  await page.screenshot({ path: absPath });
+  return false;
+}
+
+/**
  * Capture a full-page or large-viewport screenshot with a visible red highlight box
  * around the target element. Does NOT crop the image, ensuring surrounding context
  * (like headers and layout) is preserved.
@@ -169,9 +286,9 @@ export async function takeHighlightedScreenshot(
   page: Page,
   absPath: string,
   selectors: string[],
-  options?: { fullPage?: boolean; label?: string; contextualZoom?: boolean; maxHighlightBox?: { width: number, height: number } }
+  options?: { fullPage?: boolean; label?: string; contextualZoom?: boolean; maxHighlightBox?: { width: number, height: number }; waitMs?: number }
 ): Promise<boolean> {
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(options?.waitMs ?? 1000);
   let highlighted = false;
 
   for (const selector of selectors) {

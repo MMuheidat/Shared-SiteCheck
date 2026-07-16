@@ -27,14 +27,17 @@ import pillar10Enquiry from '@/lib/engine/pillar10-enquiry';
 // "Run All Pillars" and the completeness check, but remain runnable individually.
 // `record` enables per-pillar screen recording: the engine runs the pillar in a dedicated
 // context with recordVideo and saves /screenshots/<auditJobId>/<record>.webm.
+// `skipInitialNav` skips the engine's pre-pillar visit to the target URL — for pillars
+// (like Discovery) whose journey starts elsewhere, so the recording opens on the real action.
 export const PILLAR_CHECKS: Array<{
   name: string;
   nameAR: string;
   fn: typeof pillar1Discovery;
   beta?: boolean;
   record?: string;
+  skipInitialNav?: boolean;
 }> = [
-  { name: 'Discovery & Access', nameAR: 'الاكتشاف والوصول', fn: pillar1Discovery, record: 'pillar1' },
+  { name: 'Discovery & Access', nameAR: 'الاكتشاف والوصول', fn: pillar1Discovery, record: 'pillar1', skipInitialNav: true },
   { name: 'Accessibility & Inclusion', nameAR: 'إمكانية الوصول والشمولية', fn: pillar2Accessibility },
   { name: 'Website Structure', nameAR: 'هيكل الموقع', fn: pillar3Structure },
   { name: 'Navigation', nameAR: 'التنقل', fn: pillar4Navigation },
@@ -92,9 +95,10 @@ async function executePillar(args: {
   url: string;
   auditJobId: string;
   entityName: string;
+  acronym: string;
   previousResults: CriterionResult[];
 }): Promise<CriterionResult[]> {
-  const { pillar, browser, sharedPage, url, auditJobId, entityName, previousResults } = args;
+  const { pillar, browser, sharedPage, url, auditJobId, entityName, acronym, previousResults } = args;
 
   const recorder = pillar.record
     ? await startPillarRecording(browser, { auditJobId, slug: pillar.record }).catch((err) => {
@@ -106,23 +110,26 @@ async function executePillar(args: {
 
   let results: CriterionResult[] = [];
   try {
-    // Ensure we're on the original URL before each pillar (some checks navigate)
-    try {
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-    } catch {
-      // Fallback: try domcontentloaded
+    if (!pillar.skipInitialNav) {
+      // Ensure we're on the original URL before each pillar (some checks navigate)
       try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      } catch { /* best effort */ }
+        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+      } catch {
+        // Fallback: try domcontentloaded
+        try {
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        } catch { /* best effort */ }
+      }
+      // Wait for JS content to render
+      await page.waitForTimeout(5000);
     }
-    // Wait for JS content to render
-    await page.waitForTimeout(5000);
 
     results = await pillar.fn({
       page,
       url,
       auditJobId,
       entityName,
+      acronym,
       previousResults,
       recorder: recorder ?? undefined,
     });
@@ -149,7 +156,7 @@ export async function runEvaluation(
     where: { id: auditJobId },
   });
 
-  const { websiteUrl: url, entityName } = auditJob;
+  const { websiteUrl: url, entityName, acronym } = auditJob;
   const allResults: CriterionResult[] = [];
   // Run All covers production pillars only — beta pillars (LLM-dependent) are excluded.
   const activePillars = PILLAR_CHECKS.filter((p) => !p.beta);
@@ -234,6 +241,7 @@ export async function runEvaluation(
           url,
           auditJobId,
           entityName,
+          acronym,
           previousResults: allResults,
         });
       } catch (pillarError) {
@@ -391,7 +399,7 @@ export async function runSinglePillar(
     where: { id: auditJobId },
   });
 
-  const { websiteUrl: url, entityName } = auditJob;
+  const { websiteUrl: url, entityName, acronym } = auditJob;
 
   // Create screenshot directory
   const screenshotDir = path.join(process.cwd(), 'public', 'screenshots', auditJobId);
@@ -462,6 +470,7 @@ export async function runSinglePillar(
         url,
         auditJobId,
         entityName,
+        acronym,
         previousResults,
       });
     } catch (pillarError) {

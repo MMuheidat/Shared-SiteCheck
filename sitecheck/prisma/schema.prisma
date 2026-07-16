@@ -22,6 +22,7 @@ model AuditJob {
   user              User              @relation(fields: [userId], references: [id])
   websiteUrl        String
   entityName        String
+  acronym           String            @default("") // optional evaluator-supplied acronym for Q1b (falls back to auto-derivation)
   serviceName       String            @default("")
   evaluatorLanguage String            @default("en")
   deviceType        String            @default("desktop")

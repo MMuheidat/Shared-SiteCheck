@@ -13,6 +13,7 @@ import {
   Loader2,
   Shield,
   AlertTriangle,
+  Tag,
 } from 'lucide-react';
 import { useToast } from '@/components/Toast';
 
@@ -23,6 +24,7 @@ export default function NewAuditPage() {
 
   const [websiteUrl, setWebsiteUrl] = useState('');
   const [entityName, setEntityName] = useState('');
+  const [acronym, setAcronym] = useState('');
   const [serviceName, setServiceName] = useState('');
   const [language, setLanguage] = useState('en');
   const [deviceType, setDeviceType] = useState('desktop');
@@ -72,6 +74,7 @@ export default function NewAuditPage() {
         body: JSON.stringify({
           websiteUrl,
           entityName,
+          acronym,
           serviceName,
           evaluatorLanguage: language,
           deviceType,
@@ -156,6 +159,27 @@ export default function NewAuditPage() {
                 placeholder="e.g., Ministry of Education"
                 required
               />
+            </div>
+
+            {/* Entity Acronym */}
+            <div>
+              <label htmlFor="acronym" className="label">
+                <div className="flex items-center gap-1.5">
+                  <Tag className="w-3.5 h-3.5 text-text-muted" />
+                  Entity Acronym <span className="text-text-muted font-normal">(optional)</span>
+                </div>
+              </label>
+              <input
+                id="acronym"
+                type="text"
+                value={acronym}
+                onChange={(e) => setAcronym(e.target.value)}
+                className="input"
+                placeholder="e.g., TAMM, ADEO"
+              />
+              <p className="text-xs text-text-muted mt-1.5">
+                Used for the acronym search check (Q1b). Leave empty to derive it automatically from the entity name.
+              </p>
             </div>
 
             {/* Service Name */}

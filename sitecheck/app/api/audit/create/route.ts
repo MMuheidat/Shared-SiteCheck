@@ -15,7 +15,7 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.json();
-    const { websiteUrl, entityName, serviceName, evaluatorLanguage, deviceType } = body;
+    const { websiteUrl, entityName, acronym, serviceName, evaluatorLanguage, deviceType } = body;
 
     // Validate required fields
     if (!websiteUrl || !entityName) {
@@ -40,6 +40,7 @@ export async function POST(request: NextRequest) {
         userId: session.user.id,
         websiteUrl,
         entityName,
+        acronym: (typeof acronym === 'string' ? acronym.trim() : '') || '',
         serviceName: serviceName || '',
         evaluatorLanguage: evaluatorLanguage || 'en',
         deviceType: deviceType || 'desktop',

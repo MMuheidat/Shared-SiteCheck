@@ -85,6 +85,8 @@ export type PillarCheckFn = (params: {
   url: string;
   auditJobId: string;
   entityName: string;
+  /** Evaluator-supplied entity acronym (Q1b); empty string means auto-derive. */
+  acronym: string;
   previousResults: CriterionResult[];
   /** Present when the engine records this pillar's run (screen-recording evidence). */
   recorder?: import('./engine/recording').EvidenceRecorder;
