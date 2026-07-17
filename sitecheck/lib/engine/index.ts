@@ -39,7 +39,7 @@ export const PILLAR_CHECKS: Array<{
 }> = [
   { name: 'Discovery & Access', nameAR: 'الاكتشاف والوصول', fn: pillar1Discovery, record: 'pillar1', skipInitialNav: true },
   { name: 'Accessibility & Inclusion', nameAR: 'إمكانية الوصول والشمولية', fn: pillar2Accessibility, record: 'pillar2' },
-  { name: 'Website Structure', nameAR: 'هيكل الموقع', fn: pillar3Structure },
+  { name: 'Website Structure', nameAR: 'هيكل الموقع', fn: pillar3Structure, record: 'pillar3' },
   { name: 'Navigation', nameAR: 'التنقل', fn: pillar4Navigation },
   { name: 'Registration', nameAR: 'التسجيل', fn: pillar5Registration },
   { name: 'Services', nameAR: 'الخدمات', fn: pillar6Services },
