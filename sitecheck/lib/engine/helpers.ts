@@ -1,5 +1,67 @@
 // lib/engine/helpers.ts — Shared navigation helpers for pillar checks
 import type { Page } from 'playwright';
+import { clickWithHighlight } from '@/lib/engine/recording';
+
+/**
+ * Hamburger / 3-dash menu buttons. Deliberately tag-agnostic: some sites use
+ * a <label> (e.g. ADMO's `label.menuburger`) or a <div>, not a <button>.
+ */
+export const BURGER_MENU_SELECTORS = [
+  '[class*="burger"]', '[class*="hamburger"]',
+  '[class*="menu-toggle"]', '[class*="nav-toggle"]', '[class*="navbar-toggler"]',
+  'button[aria-label*="menu" i]', '[aria-label*="القائمة"]',
+  'label[class*="menu"]', '[id*="menu-toggle"]', '[class*="menu-btn"]', '[class*="menu-icon"]',
+];
+
+/** Count same-origin links a human could actually click (visible in viewport). */
+async function countViewportNavLinks(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const orig = location.origin;
+    let n = 0;
+    for (const a of document.querySelectorAll('a[href]')) {
+      const href = (a as HTMLAnchorElement).href;
+      if (!href.startsWith(orig) || href === orig + '/' || href.includes('#')) continue;
+      const r = a.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.top >= 0 && r.bottom <= window.innerHeight &&
+          r.left >= 0 && r.right <= window.innerWidth) n++;
+    }
+    return n;
+  }).catch(() => 0);
+}
+
+/**
+ * Open the site's hamburger navigation menu, if one exists: find a small
+ * burger-like control near the top of the page, click it (with a highlight
+ * hold so recordings show the deliberate action), and confirm the menu
+ * actually opened by checking that more nav links became clickable.
+ * Best-effort — returns false on any failure, never throws.
+ */
+export async function openNavMenu(
+  page: Page,
+  opts?: { holdMs?: number },
+): Promise<boolean> {
+  const holdMs = opts?.holdMs ?? 100;
+  try {
+    for (const sel of BURGER_MENU_SELECTORS) {
+      const loc = page.locator(sel).first();
+      if (!(await loc.isVisible().catch(() => false))) continue;
+      const box = await loc.boundingBox().catch(() => null);
+      // Small control in the top region of the page (headers), not footer links
+      if (!box || box.width < 12 || box.height < 8 || box.width > 100 || box.height > 100) continue;
+      if (box.y > 250) continue;
+
+      const before = await countViewportNavLinks(page);
+      await clickWithHighlight(loc, { holdMs, timeout: 4000 });
+      await page.waitForTimeout(1200);
+      const after = await countViewportNavLinks(page);
+      if (after > before) return true;
+      // Clicked something that didn't reveal nav — close it and stop guessing
+      try { await page.keyboard.press('Escape'); } catch { /* */ }
+      return false;
+    }
+  } catch { /* cosmetics + navigation aid only */ }
+  return false;
+}
 
 /**
  * Navigate to a URL and wait for the page to fully render.
