@@ -76,7 +76,7 @@ export default function ResultsPage() {
 
   const fetchAudit = useCallback(async () => {
     try {
-      const res = await fetch(`/api/audit/${id}`);
+      const res = await fetch(`/api/audit/${id}`, { cache: 'no-store' });
       if (!res.ok) {
         throw new Error('Failed to load audit results');
       }
@@ -94,6 +94,15 @@ export default function ResultsPage() {
   useEffect(() => {
     fetchAudit();
   }, [fetchAudit]);
+
+  // If the page is opened (or reloaded) while a run is in progress, keep
+  // polling until the job leaves 'running'. The button handlers below poll
+  // for runs started on this page; this effect covers everything else.
+  useEffect(() => {
+    if (audit?.status !== 'running') return;
+    const interval = setInterval(fetchAudit, 5000);
+    return () => clearInterval(interval);
+  }, [audit?.status, fetchAudit]);
 
   // Load pillar list
   useEffect(() => {
@@ -155,21 +164,22 @@ export default function ResultsPage() {
         throw new Error(err.error || 'Failed to start pillar check');
       }
 
-      // Poll for completion (check every 5 seconds)
+      // Poll for completion (check every 5 seconds). The run-pillar API flips
+      // the job to 'running' before the engine starts, and the engine writes
+      // the final complete/partial status when it finishes — THAT is the
+      // reliable "done" signal. (This pillar's old rows survive in the DB
+      // until the re-run finishes, so their mere presence means nothing.)
       const pollInterval = setInterval(async () => {
         try {
-          const statusRes = await fetch(`/api/audit/${id}`);
+          const statusRes = await fetch(`/api/audit/${id}`, { cache: 'no-store' });
           if (statusRes.ok) {
             const data = await statusRes.json();
             setAudit(data);
 
-            // Check if this pillar's results are new/updated
-            const pillarResults = data.results?.filter(
-              (r: { pillar: string }) => r.pillar === pillarName
-            );
-            if (pillarResults && pillarResults.length > 0) {
-              // The pillar has results — check if still running
-              // We'll stop polling after results appear (they get replaced on re-run)
+            if (data.status === 'complete' || data.status === 'partial' || data.status === 'failed') {
+              const pillarResults = data.results?.filter(
+                (r: { pillar: string }) => r.pillar === pillarName
+              ) ?? [];
               const earned = pillarResults.reduce(
                 (sum: number, r: { scoreEarned: number }) => sum + r.scoreEarned,
                 0
@@ -179,7 +189,6 @@ export default function ResultsPage() {
                 0
               );
 
-              // If the running set still has this pillar and we got new results, mark done
               setRunningPillars((prev) => {
                 const next = new Set(prev);
                 next.delete(pillarName);
@@ -235,21 +244,22 @@ export default function ResultsPage() {
       // Mark all production pillars as running (beta pillars are excluded from Run All)
       setRunningPillars(new Set(pillars.filter((p) => !p.beta).map((p) => p.name)));
 
-      // Poll for overall completion
+      // Poll for overall completion ('partial' is also terminal — e.g. beta
+      // pillars pending or a pillar left the job incomplete)
       const pollInterval = setInterval(async () => {
         try {
-          const statusRes = await fetch(`/api/audit/${id}`);
+          const statusRes = await fetch(`/api/audit/${id}`, { cache: 'no-store' });
           if (statusRes.ok) {
             const data = await statusRes.json();
             setAudit(data);
-            if (data.status === 'complete' || data.status === 'failed') {
+            if (data.status === 'complete' || data.status === 'partial' || data.status === 'failed') {
               clearInterval(pollInterval);
               setRunningPillars(new Set());
               showToast(
-                data.status === 'complete'
-                  ? `Evaluation complete! Score: ${data.totalScore}/${data.maxScore}`
-                  : 'Evaluation failed.',
-                data.status === 'complete' ? 'success' : 'error'
+                data.status === 'failed'
+                  ? 'Evaluation failed.'
+                  : `Evaluation ${data.status === 'complete' ? 'complete' : 'finished (partial)'}! Score: ${data.totalScore}/${data.maxScore}`,
+                data.status === 'failed' ? 'error' : 'success'
               );
             }
           }

@@ -74,8 +74,27 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
     }
   };
 
+  // Pillar name → ordinal, mirroring PILLAR_CHECKS order in lib/engine/index.ts
+  // (not imported to keep engine deps out of this client component).
+  const PILLAR_NUMBERS: Record<string, number> = {
+    'Discovery & Access': 1,
+    'Accessibility & Inclusion': 2,
+    'Website Structure': 3,
+    'Navigation': 4,
+    'Registration': 5,
+    'Services': 6,
+    'Performance': 7,
+    'Customer Privacy': 8,
+    'Live Chat': 9,
+    'Enquiry Form Journey': 10,
+  };
+  const pillarVideoLabel = (pillar: string) => {
+    const n = PILLAR_NUMBERS[pillar];
+    return n ? `Pillar ${n} Video — ${pillar}` : `${pillar} — Video`;
+  };
+
   // One screen-recording per pillar (every row of a recorded pillar carries the
-  // same videoPath) — surfaced as a single "Show Video" bar under the pillar's rows.
+  // same videoPath) — surfaced as a single video bar under the pillar's rows.
   const pillarVideos = useMemo(() => {
     const map = new Map<string, string>();
     for (const r of results) {
@@ -182,11 +201,11 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
               <tr>
                 <td colSpan={7} className="!py-2">
                   <button
-                    onClick={() => onScreenshotClick(pillarVideo, `${r.pillar} — Screen Recording`)}
+                    onClick={() => onScreenshotClick(pillarVideo, pillarVideoLabel(r.pillar))}
                     className="w-full text-xs py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 transition-all duration-200 bg-primary text-white hover:bg-primary-dark shadow-sm"
                   >
                     <Video className="w-3.5 h-3.5" />
-                    Show Video
+                    {pillarVideoLabel(r.pillar)}
                   </button>
                 </td>
               </tr>

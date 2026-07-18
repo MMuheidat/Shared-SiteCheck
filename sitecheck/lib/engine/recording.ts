@@ -162,6 +162,50 @@ export async function startPillarRecording(
 }
 
 /**
+ * Slow, human-paced scroll down the page (visible wheel steps) to "verify" the
+ * current state on video — e.g. after a language switch, text resize, or theme
+ * change — then return to the top. Pillar 1 keeps its own shorter local
+ * `humanScanScroll`; this is the shared, deeper variant for pillar journeys.
+ * Pure evidence cosmetics: best-effort, must never fail a criterion.
+ */
+export async function humanScrollVerify(
+  page: Page,
+  opts?: { stepPx?: number; delayMs?: number; maxSteps?: number; returnToTop?: boolean },
+): Promise<void> {
+  const stepPx = opts?.stepPx ?? 300;
+  const delayMs = opts?.delayMs ?? 400;
+  const maxSteps = opts?.maxSteps ?? 10;
+  const returnToTop = opts?.returnToTop ?? true;
+
+  try {
+    let steps = 0;
+    while (steps < maxSteps) {
+      const atBottom = await page.evaluate(() => {
+        const el = document.scrollingElement || document.documentElement;
+        return el.scrollTop + window.innerHeight >= el.scrollHeight - 10;
+      });
+      if (atBottom) break;
+      await page.mouse.wheel(0, stepPx);
+      await page.waitForTimeout(delayMs);
+      steps++;
+    }
+    await page.waitForTimeout(600); // linger at the deepest point
+
+    if (returnToTop) {
+      // Faster upward strokes — a human flicking back to the top
+      for (let i = 0; i < Math.ceil((steps * stepPx) / 900) + 1; i++) {
+        await page.mouse.wheel(0, -900);
+        await page.waitForTimeout(200);
+      }
+      await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+      await page.waitForTimeout(300);
+    }
+  } catch {
+    /* cosmetics only */
+  }
+}
+
+/**
  * Click with a visible red outline held on the element beforehand, so the
  * recorded video clearly shows what is about to be clicked (the click ripple
  * fires as well). Falls back to a plain click if the styling fails.

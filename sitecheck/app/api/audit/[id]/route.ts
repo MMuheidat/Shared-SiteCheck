@@ -39,7 +39,11 @@ export async function GET(
       );
     }
 
-    return NextResponse.json(auditJob);
+    // The results page polls this endpoint while a run is in progress —
+    // never let the browser serve a cached copy of the job snapshot.
+    return NextResponse.json(auditJob, {
+      headers: { 'Cache-Control': 'no-store' },
+    });
   } catch (error) {
     console.error('Get audit error:', error);
     return NextResponse.json(

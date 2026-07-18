@@ -1,5 +1,67 @@
 // lib/engine/helpers.ts — Shared navigation helpers for pillar checks
 import type { Page } from 'playwright';
+import { clickWithHighlight, type EvidenceRecorder } from '@/lib/engine/recording';
+
+/**
+ * Hamburger / 3-dash menu buttons. Deliberately tag-agnostic: some sites use
+ * a <label> (e.g. ADMO's `label.menuburger`) or a <div>, not a <button>.
+ */
+export const BURGER_MENU_SELECTORS = [
+  '[class*="burger"]', '[class*="hamburger"]',
+  '[class*="menu-toggle"]', '[class*="nav-toggle"]', '[class*="navbar-toggler"]',
+  'button[aria-label*="menu" i]', '[aria-label*="القائمة"]',
+  'label[class*="menu"]', '[id*="menu-toggle"]', '[class*="menu-btn"]', '[class*="menu-icon"]',
+];
+
+/** Count same-origin links a human could actually click (visible in viewport). */
+async function countViewportNavLinks(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const orig = location.origin;
+    let n = 0;
+    for (const a of document.querySelectorAll('a[href]')) {
+      const href = (a as HTMLAnchorElement).href;
+      if (!href.startsWith(orig) || href === orig + '/' || href.includes('#')) continue;
+      const r = a.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.top >= 0 && r.bottom <= window.innerHeight &&
+          r.left >= 0 && r.right <= window.innerWidth) n++;
+    }
+    return n;
+  }).catch(() => 0);
+}
+
+/**
+ * Open the site's hamburger navigation menu, if one exists: find a small
+ * burger-like control near the top of the page, click it (with a highlight
+ * hold so recordings show the deliberate action), and confirm the menu
+ * actually opened by checking that more nav links became clickable.
+ * Best-effort — returns false on any failure, never throws.
+ */
+export async function openNavMenu(
+  page: Page,
+  opts?: { holdMs?: number },
+): Promise<boolean> {
+  const holdMs = opts?.holdMs ?? 100;
+  try {
+    for (const sel of BURGER_MENU_SELECTORS) {
+      const loc = page.locator(sel).first();
+      if (!(await loc.isVisible().catch(() => false))) continue;
+      const box = await loc.boundingBox().catch(() => null);
+      // Small control in the top region of the page (headers), not footer links
+      if (!box || box.width < 12 || box.height < 8 || box.width > 100 || box.height > 100) continue;
+      if (box.y > 250) continue;
+
+      const before = await countViewportNavLinks(page);
+      await clickWithHighlight(loc, { holdMs, timeout: 4000 });
+      await page.waitForTimeout(1200);
+      const after = await countViewportNavLinks(page);
+      if (after > before) return true;
+      // Clicked something that didn't reveal nav — close it and stop guessing
+      try { await page.keyboard.press('Escape'); } catch { /* */ }
+      return false;
+    }
+  } catch { /* cosmetics + navigation aid only */ }
+  return false;
+}
 
 /**
  * Navigate to a URL and wait for the page to fully render.
@@ -422,4 +484,248 @@ export async function takeHighlightedScreenshot(
     await page.screenshot({ path: absPath, fullPage: useFullPage, clip });
   }
   return false;
+}
+
+export interface HighlightTarget {
+  /** CSS selector; ALL visible matches are highlighted (unlike takeHighlightedScreenshot). */
+  selector: string;
+  /** Red label pill placed near the FIRST match of this selector. */
+  label?: string;
+}
+
+/**
+ * Outline every visible element matched by the targets (deduped across
+ * selectors), scroll the densest vertical cluster of matches into view, and
+ * place label pills. Elements larger than maxBox are skipped so container
+ * wrappers (whole footers/navs) never swallow the individual highlights.
+ * Elements are tagged data-sitecheck-multi for clearHighlights.
+ * Best-effort — returns the number highlighted, never throws.
+ */
+export async function highlightElements(
+  page: Page,
+  targets: HighlightTarget[],
+  opts?: {
+    maxTotal?: number;
+    maxBox?: { width: number; height: number };
+    scrollToCluster?: boolean;
+  },
+): Promise<number> {
+  try {
+    return await page.evaluate(
+      (args: {
+        targets: { selector: string; label?: string }[];
+        maxTotal: number;
+        maxBox: { width: number; height: number };
+        scrollToCluster: boolean;
+      }) => {
+        const picked: { el: HTMLElement; label?: string }[] = [];
+        const seen = new Set<Element>();
+        for (const t of args.targets) {
+          let matches: Element[] = [];
+          try { matches = Array.from(document.querySelectorAll(t.selector)); } catch { continue; }
+          let firstOfSelector = true;
+          for (const el of matches) {
+            if (seen.has(el)) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) continue;
+            if (r.width > args.maxBox.width || r.height > args.maxBox.height) continue;
+            // Horizontally off-canvas (closed drawer) elements have a box but a
+            // human can't see them — skip. Vertical off-viewport is fine (we scroll).
+            if (r.right <= 0 || r.left >= window.innerWidth) continue;
+            const style = window.getComputedStyle(el);
+            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
+            seen.add(el);
+            picked.push({ el: el as HTMLElement, label: firstOfSelector ? t.label : undefined });
+            firstOfSelector = false;
+            if (picked.length >= args.maxTotal) break;
+          }
+          if (picked.length >= args.maxTotal) break;
+        }
+        if (picked.length === 0) return 0;
+
+        // Scroll the viewport-height window containing the most matches into
+        // view (social icon rows usually live in the footer).
+        if (args.scrollToCluster) {
+          const ys = picked.map(p => p.el.getBoundingClientRect().top + window.scrollY);
+          const vh = window.innerHeight;
+          let bestTop = Math.max(0, Math.min(...ys) - 120);
+          let bestCount = -1;
+          for (const y of ys) {
+            const winTop = Math.max(0, y - 120);
+            const count = ys.filter(v => v >= winTop && v <= winTop + vh - 160).length;
+            if (count > bestCount) { bestCount = count; bestTop = winTop; }
+          }
+          window.scrollTo(0, bestTop);
+        }
+
+        for (const p of picked) {
+          const el = p.el;
+          el.dataset.sitecheckMultiOutline = el.style.outline;
+          el.dataset.sitecheckMultiOffset = el.style.outlineOffset;
+          el.dataset.sitecheckMultiShadow = el.style.boxShadow;
+          el.dataset.sitecheckMulti = '1';
+          // The label pill is created later (settleHighlightsAndPlaceLabels):
+          // infinite-feed pages hijack the scroll position when new content
+          // loads, so pills placed now would anchor to stale coordinates.
+          if (p.label) el.dataset.sitecheckMultiLabel = p.label;
+          el.style.outline = '4px solid red';
+          el.style.outlineOffset = '2px';
+          el.style.boxShadow = '0 0 15px rgba(255, 0, 0, 0.5)';
+          el.style.transition = 'none';
+        }
+        return picked.length;
+      },
+      {
+        targets,
+        maxTotal: opts?.maxTotal ?? 12,
+        maxBox: opts?.maxBox ?? { width: 600, height: 300 },
+        scrollToCluster: opts?.scrollToCluster ?? true,
+      },
+    );
+  } catch {
+    return 0; // evidence cosmetics never fail a criterion
+  }
+}
+
+/** Undo highlightElements: restore saved styles, remove label pills. */
+export async function clearHighlights(page: Page): Promise<void> {
+  try {
+    await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll('[data-sitecheck-multi]'))) {
+        const h = el as HTMLElement;
+        h.style.outline = h.dataset.sitecheckMultiOutline || '';
+        h.style.outlineOffset = h.dataset.sitecheckMultiOffset || '';
+        h.style.boxShadow = h.dataset.sitecheckMultiShadow || '';
+        delete h.dataset.sitecheckMulti;
+        delete h.dataset.sitecheckMultiOutline;
+        delete h.dataset.sitecheckMultiOffset;
+        delete h.dataset.sitecheckMultiShadow;
+        delete h.dataset.sitecheckMultiLabel;
+      }
+      for (const pill of Array.from(document.querySelectorAll('.__sitecheck_multi_label'))) pill.remove();
+    });
+  } catch { /* page may have navigated away */ }
+}
+
+/**
+ * Make sure at least one highlighted element is actually inside the viewport
+ * (infinite-feed pages insert content when scrolled, which moves the target
+ * away — e.g. ADMO's footer), then create the label pills at the settled
+ * coordinates. Best-effort, never throws.
+ */
+async function settleHighlightsAndPlaceLabels(page: Page): Promise<void> {
+  for (let i = 0; i < 4; i++) {
+    const inView = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll('[data-sitecheck-multi]'));
+      if (els.length === 0) return true;
+      const visible = els.some(el => {
+        const r = el.getBoundingClientRect();
+        return r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;
+      });
+      if (!visible) {
+        const r = els[0].getBoundingClientRect();
+        window.scrollTo(0, Math.max(0, r.top + window.scrollY - Math.floor(window.innerHeight / 3)));
+      }
+      return visible;
+    }).catch(() => true);
+    if (inView) break;
+    await page.waitForTimeout(700);
+  }
+  await page.evaluate(() => {
+    // Idempotent: drop stale pills so a re-settle pass can re-place them.
+    for (const pill of Array.from(document.querySelectorAll('.__sitecheck_multi_label'))) pill.remove();
+    for (const el of Array.from(document.querySelectorAll('[data-sitecheck-multi]'))) {
+      const label = (el as HTMLElement).dataset.sitecheckMultiLabel;
+      if (!label) continue;
+      const rect = el.getBoundingClientRect();
+      const pill = document.createElement('div');
+      pill.textContent = label;
+      pill.className = '__sitecheck_multi_label';
+      pill.style.cssText =
+        'position:absolute;background:red;color:white;padding:4px 8px;' +
+        'font:bold 14px/1.3 Arial,sans-serif;border-radius:4px;' +
+        'pointer-events:none;z-index:2147483647;white-space:nowrap;';
+      document.body.appendChild(pill);
+      const pr = pill.getBoundingClientRect();
+      let top = rect.top + window.scrollY - pr.height - 8;
+      if (rect.top < pr.height + 10) top = rect.bottom + window.scrollY + 8;
+      let left = rect.left + window.scrollX;
+      if (rect.left + pr.width > window.innerWidth) {
+        left = window.innerWidth + window.scrollX - pr.width - 8;
+      }
+      if (left < window.scrollX + 4) left = window.scrollX + 4;
+      pill.style.top = `${top}px`;
+      pill.style.left = `${left}px`;
+    }
+  }).catch(() => { /* best-effort */ });
+}
+
+/**
+ * highlightElements → hold (visible on recordings) → viewport screenshot
+ * (height capped at 800px) → clearHighlights (unless keepHighlights).
+ * Zero matches still produce a plain viewport shot so evidence is never blank.
+ * Returns the highlight count.
+ */
+export async function takeMultiHighlightScreenshot(
+  page: Page,
+  absPath: string,
+  targets: HighlightTarget[],
+  opts?: {
+    holdMs?: number;
+    maxTotal?: number;
+    maxBox?: { width: number; height: number };
+    keepHighlights?: boolean;
+    scrollToCluster?: boolean;
+  },
+): Promise<number> {
+  const count = await highlightElements(page, targets, {
+    maxTotal: opts?.maxTotal,
+    maxBox: opts?.maxBox,
+    scrollToCluster: opts?.scrollToCluster,
+  });
+  if (count > 0) await settleHighlightsAndPlaceLabels(page);
+  await page.waitForTimeout(opts?.holdMs ?? 400);
+  // Infinite-feed pages can insert content DURING the hold and push the
+  // highlighted cluster out of view again — re-settle right before the shot.
+  if (count > 0) await settleHighlightsAndPlaceLabels(page);
+  try {
+    const viewport = page.viewportSize();
+    if (viewport) {
+      await page.screenshot({
+        path: absPath,
+        clip: { x: 0, y: 0, width: viewport.width, height: Math.min(viewport.height, 800) },
+      });
+    } else {
+      await page.screenshot({ path: absPath });
+    }
+  } catch { /* best-effort evidence */ }
+  if (!opts?.keepHighlights) await clearHighlights(page);
+  return count;
+}
+
+/**
+ * Click the on-page anchor for href like a human visitor would. Re-opens the
+ * burger menu when the anchor is hidden, forces same-tab navigation (menu
+ * links sometimes open new tabs, which would not appear on the recorded
+ * page's video), and falls back to a direct goto when clicking isn't possible.
+ * Shared version of the pattern used by pillars 2 and 3.
+ */
+export async function humanNavigate(page: Page, href: string, recorder?: EvidenceRecorder): Promise<void> {
+  try {
+    const u = new URL(href);
+    const sel = `a[href="${href}"], a[href="${u.pathname + u.search}"]`;
+    let anchor = page.locator(sel).first();
+    if (!(await anchor.isVisible().catch(() => false))) {
+      await openNavMenu(page, { holdMs: recorder ? 1000 : 100 });
+      anchor = page.locator(sel).first();
+    }
+    if (await anchor.isVisible().catch(() => false)) {
+      await anchor.evaluate(el => { (el as HTMLAnchorElement).target = '_self'; }).catch(() => {});
+      await clickWithHighlight(anchor, { holdMs: recorder ? 1000 : 300, timeout: 5000 });
+      try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch { /* */ }
+      await page.waitForTimeout(1500);
+      return;
+    }
+  } catch { /* fall through to direct navigation */ }
+  await navigateAndWait(page, href);
 }

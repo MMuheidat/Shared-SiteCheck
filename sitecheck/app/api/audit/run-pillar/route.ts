@@ -46,13 +46,35 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Fire and forget — import the engine and run the single pillar
+    // Mark the job as running BEFORE returning so the results page's poll
+    // has a reliable in-progress signal (runSinglePillar sets the final
+    // complete/partial status when it finishes).
+    await prisma.auditJob.update({
+      where: { id: auditJobId },
+      data: { status: 'running' },
+    });
+
+    // Fire and forget — import the engine and run the single pillar.
+    // If the run dies before writing its final status, drop back to
+    // 'partial' so the job can't stay stuck at 'running'.
     import('@/lib/engine/index').then(({ runSinglePillar }) => {
-      void runSinglePillar(auditJobId, pillarName).then((result) => {
-        console.log(`[SiteCheck] Single pillar run complete:`, result);
-      });
-    }).catch((err) => {
+      void runSinglePillar(auditJobId, pillarName)
+        .then((result) => {
+          console.log(`[SiteCheck] Single pillar run complete:`, result);
+        })
+        .catch(async (err) => {
+          console.error('Single pillar evaluation crashed:', err);
+          await prisma.auditJob.update({
+            where: { id: auditJobId },
+            data: { status: 'partial' },
+          }).catch(() => null);
+        });
+    }).catch(async (err) => {
       console.error('Failed to start single pillar evaluation:', err);
+      await prisma.auditJob.update({
+        where: { id: auditJobId },
+        data: { status: 'partial' },
+      }).catch(() => null);
     });
 
     return NextResponse.json({ status: 'started', pillarName });

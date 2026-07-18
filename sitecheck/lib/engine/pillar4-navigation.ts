@@ -11,7 +11,11 @@ import type { Page } from 'playwright';
 import type { CriterionResult } from '@/lib/types';
 import { getCriterion, getRecommendation } from '@/lib/scoring';
 import path from 'path';
-import { navigateAndWait, takeHighlightedScreenshot, dismissCookieBanner } from '@/lib/engine/helpers';
+import {
+  navigateAndWait, takeHighlightedScreenshot, takeMultiHighlightScreenshot,
+  dismissCookieBanner, openNavMenu, humanNavigate,
+} from '@/lib/engine/helpers';
+import { clickWithHighlight, humanScrollVerify, type EvidenceRecorder } from '@/lib/engine/recording';
 
 // Login/authentication pages (e.g. UAE Pass) are exceptional — they are not
 // expected to carry the site's standard chrome like the search bar.
@@ -37,12 +41,18 @@ function makeResult(qid: string, overrides: Partial<CriterionResult> = {}): Crit
   };
 }
 
-function ssPath(auditJobId: string, name: string) {
-  const fileName = `q${name}.png`;
+function ssPath(auditJobId: string, name: string, suffix = '') {
+  const fileName = `q${name}${suffix}.png`;
   return {
     rel: `/screenshots/${auditJobId}/${fileName}`,
     abs: path.join(process.cwd(), 'public', 'screenshots', auditJobId, fileName),
   };
+}
+
+// Terminal progress log — the evaluator watches the dev-server output to see
+// where the engine currently is during a multi-minute recorded run.
+function dbg(msg: string): void {
+  console.log(`[SiteCheck][P4] ${msg}`);
 }
 
 // Medium-zoom evidence shot: current viewport, height capped at 800px.
@@ -87,84 +97,258 @@ async function discoverInternalLinks(page: Page, url: string, max = 3): Promise<
 // ────────────────────────────────────────────────────────────
 //  Q12 — Social Media Links (3-tier per criteria sheet)
 //  Available AND functional [2] / available but not functional [1] / none [0]
-//  Functionality is verified by actually opening the links in a new tab and
-//  confirming they land on the social platform.
+//  ALL found links are highlighted together and ALL are verified — the full
+//  2 points require every link to actually reach its platform. On recorded
+//  runs each platform is visited on camera; otherwise background tabs are used.
 // ────────────────────────────────────────────────────────────
 const SOCIAL_DOMAINS = [
   'twitter.com', 'x.com', 'facebook.com', 'instagram.com',
   'linkedin.com', 'youtube.com', 'tiktok.com', 'snapchat.com',
-  'pinterest.com', 'whatsapp.com', 't.me',
+  'pinterest.com', 'whatsapp.com', 'wa.me', 't.me',
+  'threads.net', 'threads.com',
 ];
 const SOCIAL_CORES = [
   'twitter', 'x.com', 'facebook', 'instagram', 'linkedin',
-  'youtube', 'tiktok', 'snapchat', 'pinterest', 'whatsapp', 't.me',
+  'youtube', 'tiktok', 'snapchat', 'pinterest', 'whatsapp', 'wa.me', 't.me',
+  'threads',
 ];
+// Share widgets ("share this page on X") are not the entity's own profiles.
+const SOCIAL_SHARE_RX = /sharer|share-?article|\/share(\?|$|\/)|intent\/(tweet|post)|\/dialog\//i;
+const MAX_SOCIAL_VISITS = 6;
 
-async function checkQ12(page: Page, auditJobId: string): Promise<CriterionResult> {
-  try {
-    const data = await page.evaluate((domains: string[]) => {
+// Login walls still count as functional: Instagram's /accounts/login,
+// LinkedIn's /authwall and YouTube's consent screen all keep the platform
+// core in the final URL, so this predicate passes them — the link did reach
+// its platform, which is what a human verifies.
+function landedOnSocial(finalUrl: string): boolean {
+  return SOCIAL_CORES.some(core => finalUrl.toLowerCase().includes(core));
+}
+
+/**
+ * Find the entity's social profile links (host-matched, share widgets
+ * excluded) and tag every matching anchor with data-sitecheck-social so the
+ * evidence shot can outline them all. Returns one representative per platform.
+ */
+async function collectSocialLinks(page: Page): Promise<{ platform: string; href: string }[]> {
+  return page.evaluate(
+    (args: { domains: string[]; shareRx: string }) => {
+      const shareRe = new RegExp(args.shareRx, 'i');
       const anchors = Array.from(document.querySelectorAll('a[href]')) as HTMLAnchorElement[];
       const found: { platform: string; href: string }[] = [];
-      for (const domain of domains) {
-        const match = anchors.find(a => a.href.toLowerCase().includes(domain));
-        if (match) found.push({ platform: domain, href: match.href });
+      for (const a of anchors) {
+        let host = '';
+        try { host = new URL(a.href).hostname.toLowerCase().replace(/^www\./, ''); } catch { continue; }
+        const domain = args.domains.find(d => host === d || host.endsWith('.' + d));
+        if (!domain || shareRe.test(a.href)) continue;
+        a.setAttribute('data-sitecheck-social', domain);
+        if (!found.some(f => f.platform === domain)) found.push({ platform: domain, href: a.href });
       }
       return found;
-    }, SOCIAL_DOMAINS);
+    },
+    { domains: SOCIAL_DOMAINS, shareRx: SOCIAL_SHARE_RX.source },
+  ).catch(() => []);
+}
 
-    const ss = ssPath(auditJobId, '12');
-    const socialSelectors = [
-      ...SOCIAL_DOMAINS.map(d => `a[href*="${d}"]`),
-      '[class*="social"] a', '[class*="social"]',
-    ];
-    await takeHighlightedScreenshot(page, ss.abs, socialSelectors, {
-      contextualZoom: true,
-      label: 'Social Media Links',
-      maxHighlightBox: { width: 600, height: 200 },
-    });
+async function checkQ12(
+  page: Page, url: string, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<CriterionResult> {
+  const ss = ssPath(auditJobId, '12');
+  try {
+    await recorder?.setCaption("Q12 — Locating the entity's social media links…");
 
-    if (data.length === 0) {
+    let found = await collectSocialLinks(page);
+    let usedBurger = false;
+    // Social links sometimes hide behind the hamburger/3-dash menu. They can
+    // also EXIST in the DOM while sitting off-canvas inside the closed drawer
+    // (e.g. ADMO renders them at negative x) — treat that the same as absent
+    // and open the menu so they become visible and clickable.
+    const anySocialOnCanvas = () => page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll('[data-sitecheck-social]'))) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 1 && r.height > 1 && r.right > 0 && r.left < window.innerWidth) return true;
+      }
+      return false;
+    }).catch(() => false);
+    if (found.length === 0 || !(await anySocialOnCanvas())) {
+      await recorder?.setCaption('Q12 — Looking for social links in the navigation menu…');
+      usedBurger = await openNavMenu(page, { holdMs: recorder ? 1000 : 100 });
+      if (usedBurger) found = await collectSocialLinks(page);
+    }
+
+    if (found.length === 0) {
+      if (usedBurger) { try { await page.keyboard.press('Escape'); } catch { /* */ } }
+      if (recorder) {
+        await recorder.setCaption('Q12 — No social media links found on this website');
+        await page.waitForTimeout(1200);
+      }
+      await viewportShot(page, ss.abs);
+      const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
       return makeResult('Q12', {
         scoreEarned: 0,
         status: 'fail',
         screenshotPath: ss.rel,
-        notes: 'No social media links found on the page.',
+        notes: `No social media links found on the page (navigation menu searched too).${stampNote}`,
       });
     }
 
-    // Functional test: open up to 2 of the links and confirm they land on a
-    // social platform (redirects like twitter.com → x.com count as working).
-    let tested = 0;
+    // Evidence: outline ALL of the social links together before any clicking.
+    // Don't cluster-scroll when the links live in the opened drawer — they are
+    // already in view, and scrolling closes some drawers (e.g. ADMO's).
+    await takeMultiHighlightScreenshot(page, ss.abs, [
+      { selector: '[data-sitecheck-social]', label: 'Social Media Links' },
+    ], {
+      holdMs: recorder ? 1200 : 400,
+      maxBox: { width: 400, height: 150 },
+      scrollToCluster: !usedBurger,
+    });
+    await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll('[data-sitecheck-social]'))) {
+        el.removeAttribute('data-sitecheck-social');
+      }
+    }).catch(() => { /* evidence only */ });
+
+    const toVisit = found.slice(0, MAX_SOCIAL_VISITS);
+    const capNote = found.length > toVisit.length
+      ? ` ${found.length - toVisit.length} more platform(s) found but not visited (capped at ${MAX_SOCIAL_VISITS}).`
+      : '';
+    const burgerNote = usedBurger ? ' Links found inside the navigation menu.' : '';
+    dbg(`Q12: found ${found.length} social platform(s) (${found.map(f => f.platform).join(', ')})${usedBurger ? ' via the navigation menu' : ''} — verifying ${toVisit.length}${recorder ? ' on camera' : ''}`);
+
     let working = 0;
     const testResults: string[] = [];
-    for (const link of data.slice(0, 2)) {
-      const socialPage = await page.context().newPage();
-      try {
-        tested++;
-        await socialPage.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await socialPage.waitForTimeout(1500);
-        const finalUrl = socialPage.url().toLowerCase();
-        const landed = SOCIAL_CORES.some(core => finalUrl.includes(core));
-        if (landed) {
-          working++;
-          testResults.push(`${link.platform} ✓`);
-        } else {
-          testResults.push(`${link.platform} ✗ (redirected to ${finalUrl.slice(0, 60)})`);
+
+    if (recorder) {
+      // On-camera journey: click each link, scroll its page like a human, return.
+      let navigatedAway = false;
+      for (const link of toVisit) {
+        await recorder.setCaption(`Q12 — Opening ${link.platform}…`);
+        dbg(`Q12: opening ${link.platform}…`);
+        let finalUrl = '';
+        try {
+          // isVisible() is true for off-canvas drawer links — require real
+          // on-canvas coordinates before trying to click like a human, and
+          // prefer an on-canvas duplicate (footer icon) over an off-canvas
+          // one (closed-drawer copy) when the same link appears twice.
+          const vpWidth = page.viewportSize()?.width ?? 1280;
+          const boxOk = async (loc: ReturnType<typeof page.locator>) => {
+            const b = await loc.boundingBox().catch(() => null);
+            return !!b && b.width > 1 && b.height > 1 && b.x + b.width > 0 && b.x < vpWidth;
+          };
+          const pickAnchor = async () => {
+            for (const sel of [`a[href="${link.href}"]`, `a[href*="${link.platform}"]`]) {
+              const candidates = await page.locator(sel).all().catch(() => []);
+              for (const cand of candidates.slice(0, 8)) {
+                if (await boxOk(cand)) return cand;
+              }
+              if (candidates.length > 0) return candidates[0];
+            }
+            return page.locator(`a[href*="${link.platform}"]`).first();
+          };
+          let anchor = await pickAnchor();
+          const clickableBox = () => boxOk(anchor);
+          if (!(await clickableBox()) && usedBurger) {
+            await openNavMenu(page, { holdMs: 1000 });
+            anchor = await pickAnchor();
+          }
+
+          // Some icons window.open regardless of target — catch stray popups.
+          let popup: Page | null = null;
+          const popupHandler = (p: Page) => { popup = p; };
+          page.context().once('page', popupHandler);
+
+          if (await clickableBox()) {
+            try {
+              await anchor.scrollIntoViewIfNeeded().catch(() => {});
+              // Force same-tab so the visit appears in the recorded page's video.
+              await anchor.evaluate(el => { (el as HTMLAnchorElement).target = '_self'; }).catch(() => {});
+              await clickWithHighlight(anchor, { holdMs: 1000, timeout: 5000 });
+              await page.waitForURL(u => landedOnSocial(u.href), { timeout: 15000, waitUntil: 'domcontentloaded' })
+                .catch(() => { /* judged below */ });
+            } catch {
+              dbg(`Q12: ${link.platform} click failed — falling back to direct goto`);
+            }
+          }
+
+          if (landedOnSocial(page.url())) {
+            finalUrl = page.url();
+            navigatedAway = true;
+          } else if (popup) {
+            const p = popup as Page;
+            await p.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+            finalUrl = p.url();
+            await p.close().catch(() => {});
+            // Replay the visit on the recorded page so it lands on video.
+            await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+            navigatedAway = true;
+            if (!landedOnSocial(finalUrl)) finalUrl = page.url();
+          } else {
+            // Click didn't take us anywhere (or anchor unclickable) — go directly.
+            await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            finalUrl = page.url();
+            navigatedAway = true;
+          }
+          page.context().off('page', popupHandler);
+
+          await page.waitForTimeout(1500);
+          if (landedOnSocial(finalUrl) || landedOnSocial(page.url())) {
+            working++;
+            testResults.push(`${link.platform} ✓`);
+            dbg(`Q12: ${link.platform} ✓`);
+            await recorder.setCaption(`Q12 — ${link.platform} opened ✓ — verifying the page…`);
+            await humanScrollVerify(page, { maxSteps: 2, delayMs: 300 });
+          } else {
+            testResults.push(`${link.platform} ✗ (landed on ${finalUrl.slice(0, 60)})`);
+            dbg(`Q12: ${link.platform} ✗ (landed on ${finalUrl.slice(0, 60)})`);
+            await recorder.setCaption(`Q12 — ${link.platform} did not open correctly ✗`);
+            await page.waitForTimeout(1200);
+          }
+        } catch {
+          testResults.push(`${link.platform} ✗ (failed to load)`);
+          dbg(`Q12: ${link.platform} ✗ (failed to load)`);
         }
-      } catch {
-        testResults.push(`${link.platform} ✗ (failed to load)`);
-      } finally {
-        await socialPage.close().catch(() => null);
+        if (navigatedAway) {
+          await recorder.setCaption('Q12 — Returning to the entity website…');
+          dbg('Q12: returning to homepage');
+          // goBack is fast and looks human; fall back to a full navigation
+          // only when history doesn't land us back on the entity site.
+          await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          await page.waitForTimeout(800);
+          if (!page.url().startsWith(new URL(url).origin)) {
+            await navigateAndWait(page, url, { waitAfter: 1000 });
+          }
+          navigatedAway = false;
+        }
+      }
+    } else {
+      // Fast path: verify every link in background tabs (same predicate).
+      for (const link of toVisit) {
+        const socialPage = await page.context().newPage();
+        try {
+          await socialPage.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await socialPage.waitForTimeout(1500);
+          if (landedOnSocial(socialPage.url())) {
+            working++;
+            testResults.push(`${link.platform} ✓`);
+          } else {
+            testResults.push(`${link.platform} ✗ (redirected to ${socialPage.url().slice(0, 60)})`);
+          }
+        } catch {
+          testResults.push(`${link.platform} ✗ (failed to load)`);
+        } finally {
+          await socialPage.close().catch(() => null);
+        }
       }
     }
 
-    const platforms = data.map(d => d.platform).join(', ');
-    if (working > 0) {
+    const tested = toVisit.length;
+    const platforms = found.map(d => d.platform).join(', ');
+    const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
+    if (working === tested) {
       return makeResult('Q12', {
         scoreEarned: 2,
         status: 'pass',
         screenshotPath: ss.rel,
-        notes: `Social media links available and functional. Platforms: ${platforms}. Tested: ${testResults.join(', ')}.`,
+        notes: `Social media links available and functional — all ${tested} verified. Platforms: ${platforms}.${capNote}${burgerNote} Tested: ${testResults.join(', ')}.${stampNote}`,
         recommendation: '',
       });
     }
@@ -172,7 +356,7 @@ async function checkQ12(page: Page, auditJobId: string): Promise<CriterionResult
       scoreEarned: 1,
       status: 'partial',
       screenshotPath: ss.rel,
-      notes: `Social media links present but could not be verified as functional. Platforms: ${platforms}. Tested ${tested}: ${testResults.join(', ')}.`,
+      notes: `Social media links present but ${tested - working} of ${tested} could not be verified as functional. Platforms: ${platforms}.${capNote}${burgerNote} Tested: ${testResults.join(', ')}.${stampNote}`,
     });
   } catch (err: unknown) {
     return makeResult('Q12', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
@@ -216,10 +400,12 @@ async function detectSearchOnPage(page: Page): Promise<boolean> {
 }
 
 async function checkQ13(
-  page: Page, url: string, auditJobId: string,
+  page: Page, url: string, auditJobId: string, recorder?: EvidenceRecorder,
 ): Promise<{ result: CriterionResult; hasSearch: boolean }> {
   try {
+    await recorder?.setCaption('Q13 — Locating the search bar on the homepage…');
     const onHomepage = await detectSearchOnPage(page);
+    dbg(`Q13: homepage search bar ${onHomepage ? 'found' : 'NOT found'}`);
 
     const ss = ssPath(auditJobId, '13');
     await takeHighlightedScreenshot(page, ss.abs, SEARCH_EVIDENCE_SELECTORS, {
@@ -231,16 +417,41 @@ async function checkQ13(
     // Check internal pages for the same search control.
     // Login/authentication pages (UAE Pass etc.) are excluded — they are
     // exceptional pages not expected to carry the search bar.
-    const internalLinks = (await discoverInternalLinks(page, url, 4))
-      .filter(l => !LOGIN_PAGE_RX.test(l))
-      .slice(0, 2);
+    let candidateLinks = (await discoverInternalLinks(page, url, 10))
+      .filter(l => !LOGIN_PAGE_RX.test(l));
+    if (candidateLinks.length < 2) {
+      // Sparse landing pages keep their navigation behind the burger menu.
+      await recorder?.setCaption('Q13 — Opening the navigation menu to find pages…');
+      if (await openNavMenu(page, { holdMs: recorder ? 1000 : 100 })) {
+        candidateLinks = (await discoverInternalLinks(page, url, 10))
+          .filter(l => !LOGIN_PAGE_RX.test(l));
+      }
+    }
+    const internalLinks = candidateLinks.slice(0, 4);
+    const stripSlash = (u: string) => u.replace(/\/+$/, '');
+    let pageIdx = 0;
     let pagesChecked = 0;
     let pagesWithSearch = 0;
     let loginPagesSkipped = 0;
     const missingOn: string[] = [];
     for (const link of internalLinks) {
       try {
-        await navigateAndWait(page, link, { waitAfter: 2000 });
+        pageIdx++;
+        if (recorder) {
+          // Navigate like a human: back to the homepage, then click the link.
+          if (stripSlash(page.url()) !== stripSlash(url)) {
+            await page.goBack({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+            await page.waitForTimeout(800);
+            if (stripSlash(page.url()) !== stripSlash(url)) {
+              await navigateAndWait(page, url, { waitAfter: 1000 });
+            }
+          }
+          await recorder.setCaption(`Q13 — Visiting an internal page (${pageIdx} of ${internalLinks.length}) to check the search bar…`);
+          dbg(`Q13: visiting internal page ${pageIdx}/${internalLinks.length}: ${link}`);
+          await humanNavigate(page, link, recorder);
+        } else {
+          await navigateAndWait(page, link, { waitAfter: 2000 });
+        }
 
         // The link may redirect to a login page (e.g. UAE Pass). The redirect is
         // client-side and can land AFTER navigation settles, so re-check the URL
@@ -254,15 +465,26 @@ async function checkQ13(
         if (!isLogin) {
           isLogin = await page.evaluate(() => {
             const body = document.body.innerText || '';
-            const sparse = body.length < 4000;
             const pwd = !!document.querySelector('input[type="password"]');
+            if (pwd) return true;
+            const sparse = body.length < 4000;
             const uaePass = body.toLowerCase().includes('uae pass') || body.includes('الهوية الرقمية');
             const signInText = /\b(sign in|log in|login)\b/i.test(body.slice(0, 2000));
-            return pwd || (sparse && (uaePass || signInText));
+            // A dedicated login page is sparse AND has almost no navigation.
+            // Visually-rich content pages (e.g. TAMM's) can carry little text
+            // but keep the site's header/footer link mass — and every page has
+            // a "Sign in" header button, so text signals alone false-positive.
+            const anchorCount = document.querySelectorAll('a[href]').length;
+            return sparse && anchorCount < 15 && (uaePass || signInText);
           });
         }
         if (isLogin) {
           loginPagesSkipped++;
+          dbg('Q13: login page reached — excluded as exceptional');
+          if (recorder) {
+            await recorder.setCaption('Q13 — Login page reached — excluded as exceptional');
+            await page.waitForTimeout(1200);
+          }
           continue;
         }
 
@@ -275,18 +497,39 @@ async function checkQ13(
         }
         if (hasSearch) pagesWithSearch++;
         else missingOn.push(page.url());
+
+        if (recorder) {
+          // Show the verdict for this page on camera (extra frames exist on
+          // disk as q13_pageN.png; only q13.png is referenced in the DB).
+          const pageShot = ssPath(auditJobId, '13', `_page${pageIdx}`);
+          if (hasSearch) {
+            dbg('Q13: search bar present on this page ✓');
+            await recorder.setCaption('Q13 — Search bar present on this page ✓');
+            await takeMultiHighlightScreenshot(
+              page, pageShot.abs,
+              SEARCH_EVIDENCE_SELECTORS.map(s => ({ selector: s })),
+              { holdMs: 1200, maxTotal: 2, maxBox: { width: 700, height: 120 } },
+            );
+          } else {
+            dbg('Q13: no search bar found on this page ✗');
+            await recorder.setCaption('Q13 — No search bar found on this page');
+            await page.waitForTimeout(1200);
+            await viewportShot(page, pageShot.abs);
+          }
+        }
       } catch { /* skip */ }
     }
     if (pagesChecked > 0 || loginPagesSkipped > 0) await navigateAndWait(page, url);
     const loginNote = loginPagesSkipped > 0 ? ` (${loginPagesSkipped} login page(s) excluded as exceptional)` : '';
     const missingNote = missingOn.length > 0 ? ` Missing on: ${missingOn.join(', ')}.` : '';
+    const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
 
     if (!onHomepage) {
       const result = makeResult('Q13', {
         scoreEarned: 0,
         status: 'fail',
         screenshotPath: ss.rel,
-        notes: `No search bar found on the homepage. Internal pages with search: ${pagesWithSearch}/${pagesChecked}.`,
+        notes: `No search bar found on the homepage. Internal pages with search: ${pagesWithSearch}/${pagesChecked}.${stampNote}`,
       });
       return { result, hasSearch: false };
     }
@@ -297,8 +540,8 @@ async function checkQ13(
         status: 'pass',
         screenshotPath: ss.rel,
         notes: pagesChecked === 0
-          ? `Search bar found on the homepage; no internal pages could be checked (treated as consistent).${loginNote}`
-          : `Search bar accessible on all checked pages (homepage + ${pagesChecked} internal).${loginNote}`,
+          ? `Search bar found on the homepage; no internal pages could be checked (treated as consistent).${loginNote}${stampNote}`
+          : `Search bar accessible on all checked pages (homepage + ${pagesChecked} internal).${loginNote}${stampNote}`,
         recommendation: '',
       });
       return { result, hasSearch: true };
@@ -308,7 +551,7 @@ async function checkQ13(
       scoreEarned: 1,
       status: 'partial',
       screenshotPath: ss.rel,
-      notes: `Search bar available on the homepage but missing on ${pagesChecked - pagesWithSearch} of ${pagesChecked} internal pages checked.${missingNote}${loginNote}`,
+      notes: `Search bar available on the homepage but missing on ${pagesChecked - pagesWithSearch} of ${pagesChecked} internal pages checked.${missingNote}${loginNote}${stampNote}`,
     });
     return { result, hasSearch: true };
   } catch (err: unknown) {
@@ -324,7 +567,68 @@ async function checkQ13(
 //  All 3 details (phone, email, address/map) [2] / 1-2 details [1] / none [0]
 //  Also follows the site's Contact page, where details usually live.
 // ────────────────────────────────────────────────────────────
-async function checkQ16(page: Page, auditJobId: string): Promise<CriterionResult> {
+// Tag the actual phone / email / address elements (smallest visible match)
+// with data-sitecheck-contact so the evidence shot outlines the details
+// themselves rather than a generic contact container. Evidence-only.
+async function markContactElements(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const firstVisible = (sel: string): Element | null => {
+      const els = Array.from(document.querySelectorAll(sel));
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 1 && r.height > 1) return el;
+      }
+      return els[0] ?? null;
+    };
+    const smallestMatching = (test: (text: string) => boolean): Element | null => {
+      const candidates = document.querySelectorAll(
+        'footer *, [class*="contact"] *, [id*="contact"] *, address, p, li, span, a, td, div',
+      );
+      let best: Element | null = null;
+      let bestArea = Infinity;
+      for (const el of Array.from(candidates)) {
+        const text = ((el as HTMLElement).innerText || '').trim();
+        if (!text || text.length > 200 || !test(text)) continue;
+        const r = el.getBoundingClientRect();
+        // Details often sit in full-width paragraphs (e.g. ADMO's contact
+        // page, 903px wide) — allow wide blocks, just not whole-page containers.
+        if (r.width < 2 || r.height < 2 || r.width > 1000 || r.height > 250) continue;
+        const area = r.width * r.height;
+        if (area < bestArea) { best = el; bestArea = area; }
+      }
+      return best;
+    };
+    const tag = (el: Element | null, kind: string): number => {
+      if (!el) return 0;
+      (el as HTMLElement).setAttribute('data-sitecheck-contact', kind);
+      return 1;
+    };
+    let tagged = 0;
+    tagged += tag(
+      firstVisible('a[href^="tel:"]') ?? smallestMatching(t => /(\+?\d[\d\-\s()]{7,}\d)/.test(t)),
+      'phone',
+    );
+    tagged += tag(
+      firstVisible('a[href^="mailto:"]') ?? smallestMatching(t => /[\w.-]+@[\w.-]+\.\w{2,}/.test(t)),
+      'email',
+    );
+    tagged += tag(
+      firstVisible(
+        'address, iframe[src*="maps"], a[href*="google.com/maps"], a[href*="maps.app.goo.gl"], a[href*="goo.gl/maps"]',
+      ) ?? smallestMatching(t => {
+        const lower = t.toLowerCase();
+        return lower.includes('address') || lower.includes('عنوان') ||
+          lower.includes('p.o. box') || lower.includes('ص.ب');
+      }),
+      'address',
+    );
+    return tagged;
+  }).catch(() => 0);
+}
+
+async function checkQ16(
+  page: Page, url: string, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<CriterionResult> {
   try {
     const detectContactDetails = () => ({
       hasPhone:
@@ -345,27 +649,67 @@ async function checkQ16(page: Page, auditJobId: string): Promise<CriterionResult
       })(),
     });
 
+    await recorder?.setCaption('Q16 — Checking the website for contact details…');
+    dbg('Q16: scanning the homepage for contact details…');
     const home = await page.evaluate(detectContactDetails);
+    const homeHasAll = home.hasPhone && home.hasEmail && home.hasAddressOrMap;
 
-    // Follow the contact page if one is linked — details often live there
-    const contactHref = await page.evaluate(() => {
-      const a = document.querySelector(
+    // Follow the contact page if one is linked — details often live there.
+    // Contact/support pages are found by href, by link text, and (both modes,
+    // so grading stays identical) behind the burger menu as a last resort.
+    const findContactHref = () => page.evaluate(() => {
+      const byHref = document.querySelector(
         'a[href*="contact" i], a[href*="اتصل"], a[href*="تواصل"]'
       ) as HTMLAnchorElement | null;
-      return a ? a.href : null;
-    });
+      if (byHref) return byHref.href;
+      const re = /contact|support|تواصل|اتصل|الدعم/i;
+      const scoped = Array.from(
+        document.querySelectorAll('header a, nav a, footer a'),
+      ) as HTMLAnchorElement[];
+      const byText = scoped.find(a => re.test((a.textContent || '').trim()));
+      return byText ? byText.href : null;
+    }).catch(() => null);
+
+    let contactHref = await findContactHref();
+    let usedBurger = false;
+    if (!contactHref && !homeHasAll) {
+      await recorder?.setCaption('Q16 — Looking for a Contact page in the navigation menu…');
+      usedBurger = await openNavMenu(page, { holdMs: recorder ? 1000 : 100 });
+      if (usedBurger) contactHref = await findContactHref();
+      if (usedBurger && !contactHref) { try { await page.keyboard.press('Escape'); } catch { /* */ } }
+    }
 
     let contactPage = { hasPhone: false, hasEmail: false, hasAddressOrMap: false };
     let contactPageChecked = false;
-    if (contactHref && !(home.hasPhone && home.hasEmail && home.hasAddressOrMap)) {
-      const cp = await page.context().newPage();
-      try {
-        await cp.goto(contactHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await cp.waitForTimeout(2500);
-        contactPage = await cp.evaluate(detectContactDetails);
-        contactPageChecked = true;
-      } catch { /* best effort */ } finally {
-        await cp.close().catch(() => null);
+    let onContactPage = false;
+    if (contactHref && !homeHasAll) {
+      if (recorder) {
+        // Visit the contact page on camera — the journey is the evidence.
+        // humanNavigate clicks the on-page anchor when clickable (reopening
+        // the burger for drawer links) and falls back to a direct goto.
+        try {
+          await recorder.setCaption('Q16 — Opening the Contact page…');
+          dbg(`Q16: opening contact page ${contactHref}`);
+          await humanNavigate(page, contactHref, recorder);
+          await dismissCookieBanner(page);
+          contactPage = await page.evaluate(detectContactDetails);
+          contactPageChecked = true;
+          onContactPage = true;
+          await recorder.setCaption('Q16 — Reviewing the contact information on this page…');
+          await humanScrollVerify(page, { maxSteps: 4 });
+        } catch {
+          dbg('Q16: on-camera contact page visit failed');
+        }
+      } else {
+        const cp = await page.context().newPage();
+        try {
+          await cp.goto(contactHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await cp.waitForTimeout(2500);
+          contactPage = await cp.evaluate(detectContactDetails);
+          contactPageChecked = true;
+        } catch { /* best effort */ } finally {
+          await cp.close().catch(() => null);
+        }
       }
     }
 
@@ -373,24 +717,56 @@ async function checkQ16(page: Page, auditJobId: string): Promise<CriterionResult
     const hasEmail = home.hasEmail || contactPage.hasEmail;
     const hasAddressOrMap = home.hasAddressOrMap || contactPage.hasAddressOrMap;
     const detailCount = [hasPhone, hasEmail, hasAddressOrMap].filter(Boolean).length;
+    dbg(`Q16: details found — phone ${hasPhone ? '✓' : '✗'} email ${hasEmail ? '✓' : '✗'} address ${hasAddressOrMap ? '✓' : '✗'}`);
 
+    // Evidence: outline the phone / email / address elements themselves on
+    // whichever page we are on (contact page when visited on camera).
     const ss = ssPath(auditJobId, '16');
-    await takeHighlightedScreenshot(page, ss.abs, [
-      'address', '[class*="contact"]', '[id*="contact"]',
-      'a[href^="tel:"]', 'a[href^="mailto:"]',
-      'a[href*="contact" i]', 'a[href*="اتصل"]', 'a[href*="تواصل"]',
-      'iframe[src*="maps"]', 'footer',
-    ], {
-      contextualZoom: true,
-      label: 'Contact Information',
-    });
+    const marked = await markContactElements(page);
+    if (marked > 0) {
+      await recorder?.setCaption('Q16 — Highlighting the phone, email and address details…');
+      await takeMultiHighlightScreenshot(page, ss.abs, [
+        { selector: '[data-sitecheck-contact="phone"]', label: 'Phone' },
+        { selector: '[data-sitecheck-contact="email"]', label: 'Email' },
+        { selector: '[data-sitecheck-contact="address"]', label: 'Address / Map' },
+      ], {
+        holdMs: recorder ? 1200 : 400,
+        maxBox: { width: 1000, height: 260 },
+      });
+      await page.evaluate(() => {
+        for (const el of Array.from(document.querySelectorAll('[data-sitecheck-contact]'))) {
+          el.removeAttribute('data-sitecheck-contact');
+        }
+      }).catch(() => { /* evidence only */ });
+    } else {
+      // Nothing markable — fall back to the container-level highlight so the
+      // evidence shot is never blank.
+      await takeHighlightedScreenshot(page, ss.abs, [
+        'address', '[class*="contact"]', '[id*="contact"]',
+        'a[href^="tel:"]', 'a[href^="mailto:"]',
+        'a[href*="contact" i]', 'a[href*="اتصل"]', 'a[href*="تواصل"]',
+        'iframe[src*="maps"]', 'footer',
+      ], {
+        contextualZoom: true,
+        label: 'Contact Information',
+      });
+    }
+
+    if (onContactPage) {
+      dbg('Q16: restoring homepage');
+      await navigateAndWait(page, url, { waitAfter: 1500 });
+      await dismissCookieBanner(page);
+    }
 
     const details = [
       hasPhone ? 'Phone ✓' : 'Phone ✗',
       hasEmail ? 'Email ✓' : 'Email ✗',
       hasAddressOrMap ? 'Address/Map ✓' : 'Address/Map ✗',
     ].join(', ');
-    const source = contactPageChecked ? ' (homepage + contact page checked)' : ' (homepage checked)';
+    const burgerNote = usedBurger ? ' Contact page found via the navigation menu.' : '';
+    const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
+    const source = (contactPageChecked ? ' (homepage + contact page checked)' : ' (homepage checked)') +
+      burgerNote + stampNote;
 
     if (detailCount === 3) {
       return makeResult('Q16', {
@@ -429,47 +805,11 @@ const FEEDBACK_SELECTORS = [
   'a[href*="rate" i]', '[class*="rating"]',
 ];
 
-async function checkQ17(page: Page, auditJobId: string): Promise<CriterionResult> {
-  try {
-    const found = await page.evaluate(() => {
-      const feedbackElements = document.querySelectorAll(
-        'a[href*="feedback" i], a[href*="survey" i], a[href*="satisfaction" i], ' +
-        '[class*="feedback"], [id*="feedback"], [class*="survey"], [id*="survey"], ' +
-        'a[href*="rate" i], [class*="rating"]'
-      );
-      const text = document.body.innerText.toLowerCase();
-      const hasFeedbackText =
-        text.includes('feedback') || text.includes('التغذية الراجعة') ||
-        text.includes('ملاحظات') || text.includes('تقييم') ||
-        text.includes('رأيك') || text.includes('your opinion') ||
-        text.includes('rate us') || text.includes('satisfaction');
-      return { elements: feedbackElements.length, hasFeedbackText };
-    });
-
-    const ss = ssPath(auditJobId, '17');
-    await takeHighlightedScreenshot(page, ss.abs, FEEDBACK_SELECTORS, {
-      contextualZoom: true,
-      label: 'Feedback / Survey',
-      maxHighlightBox: { width: 500, height: 200 },
-    });
-
-    const passed = found.elements > 0 || found.hasFeedbackText;
-    return makeResult('Q17', {
-      scoreEarned: passed ? 1 : 0,
-      status: passed ? 'pass' : 'fail',
-      screenshotPath: ss.rel,
-      notes: `Feedback elements: ${found.elements}. Feedback-related text: ${found.hasFeedbackText ? 'Yes' : 'No'}.`,
-      recommendation: passed ? '' : getRecommendation('Q17'),
-    });
-  } catch (err: unknown) {
-    return makeResult('Q17', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
-  }
-}
-
 // ────────────────────────────────────────────────────────────
-//  Q17.1 — Feedback easy to find and complete [1/0] (depends Q17)
-//  Easy to find: control sits in header/footer/nav or is a floating widget.
-//  Easy to complete: the feedback page/embed contains a manageable form.
+//  Q17 + Q17.1 run as ONE continuous journey (recorded on camera):
+//  locate the feedback option → highlight WHERE it sits (q17_1.png) →
+//  click it and let the actual form/modal open (q17.png shows the FORM).
+//  Q17.1 (easy to find + complete) depends on Q17 passing.
 // ────────────────────────────────────────────────────────────
 // Inspect an opened feedback page/modal for how completable it is.
 // Runs via page.evaluate on whichever page holds the feedback UI, so it must
@@ -504,10 +844,62 @@ function inspectFeedbackForm() {
   return { formFields: minFields, hasEmbed, hasRatingUI, hasSurveyDialog: surveyText && actionButton };
 }
 
-async function checkQ17_1(page: Page, auditJobId: string, q17Passed: boolean): Promise<CriterionResult> {
-  if (!q17Passed) {
-    return makeResult('Q17.1', { status: 'skipped', notes: 'Skipped — Q17 did not pass.' });
+async function runFeedbackJourney(
+  page: Page, url: string, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<{ q17: CriterionResult; q17_1: CriterionResult }> {
+  const ss17 = ssPath(auditJobId, '17');
+  const ss171 = ssPath(auditJobId, '17_1');
+  const stampNote = () => (recorder ? ` [${recorder.stamp()}]` : '');
+
+  // ---- Q17: is a feedback/survey option available at all?
+  let q17: CriterionResult;
+  let q17Passed = false;
+  try {
+    await recorder?.setCaption('Q17 — Looking for a feedback or survey option…');
+    dbg('Q17: scanning for feedback/survey elements…');
+    const found = await page.evaluate(() => {
+      const feedbackElements = document.querySelectorAll(
+        'a[href*="feedback" i], a[href*="survey" i], a[href*="satisfaction" i], ' +
+        '[class*="feedback"], [id*="feedback"], [class*="survey"], [id*="survey"], ' +
+        'a[href*="rate" i], [class*="rating"]'
+      );
+      const text = document.body.innerText.toLowerCase();
+      const hasFeedbackText =
+        text.includes('feedback') || text.includes('التغذية الراجعة') ||
+        text.includes('ملاحظات') || text.includes('تقييم') ||
+        text.includes('رأيك') || text.includes('your opinion') ||
+        text.includes('rate us') || text.includes('satisfaction');
+      return { elements: feedbackElements.length, hasFeedbackText };
+    });
+    q17Passed = found.elements > 0 || found.hasFeedbackText;
+    dbg(`Q17: elements=${found.elements}, feedback text=${found.hasFeedbackText ? 'yes' : 'no'} → ${q17Passed ? 'available' : 'not found'}`);
+    q17 = makeResult('Q17', {
+      scoreEarned: q17Passed ? 1 : 0,
+      status: q17Passed ? 'pass' : 'fail',
+      screenshotPath: ss17.rel,
+      notes: `Feedback elements: ${found.elements}. Feedback-related text: ${found.hasFeedbackText ? 'Yes' : 'No'}.${stampNote()}`,
+      recommendation: q17Passed ? '' : getRecommendation('Q17'),
+    });
+  } catch (err: unknown) {
+    q17 = makeResult('Q17', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
   }
+
+  if (!q17Passed) {
+    if (recorder) {
+      await recorder.setCaption('Q17 — No feedback or survey option found on this website');
+      await page.waitForTimeout(1200);
+    }
+    await viewportShot(page, ss17.abs).catch(() => {});
+    return {
+      q17,
+      q17_1: makeResult('Q17.1', { status: 'skipped', notes: 'Skipped — Q17 did not pass.' }),
+    };
+  }
+
+  // ---- Q17.1: where the option sits (q17_1.png) + open the actual form (q17.png)
+  let q17_1: CriterionResult;
+  let navigatedAway = false;
+  let modalOpened = false;
   try {
     const findability = await page.evaluate(() => {
       const sels =
@@ -527,31 +919,84 @@ async function checkQ17_1(page: Page, auditJobId: string, q17Passed: boolean): P
       }
       return { prominent: false, how: els.length ? 'present but buried in page content' : 'not found' };
     });
+    dbg(`Q17.1: feedback option ${findability.how}`);
 
-    const feedbackHref = await page.evaluate(() => {
-      const a = document.querySelector(
-        'a[href*="feedback" i], a[href*="survey" i], a[href*="satisfaction" i]'
-      ) as HTMLAnchorElement | null;
-      return a ? a.href : null;
+    // q17_1.png = WHERE the feedback option lives, before any navigation.
+    await recorder?.setCaption(`Q17.1 — Feedback option located (${findability.how})`);
+    await takeHighlightedScreenshot(page, ss171.abs, FEEDBACK_SELECTORS, {
+      contextualZoom: true,
+      label: 'Feedback Link',
+      maxHighlightBox: { width: 500, height: 200 },
     });
 
-    const ss = ssPath(auditJobId, '17_1');
+    const feedbackHref = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll(
+        'a[href*="feedback" i], a[href*="survey" i], a[href*="satisfaction" i]'
+      )) as HTMLAnchorElement[];
+      const kwRe = /feedback|survey|satisfaction|ملاحظات|تقييم|استبيان|رأيك/i;
+      // Prefer a link whose visible TEXT says feedback/survey — href-substring
+      // matches alone can hit news articles ("…mapping survey across…").
+      const byText = anchors.find(a => kwRe.test((a.textContent || '').trim()));
+      if (byText) return byText.href;
+      const plausible = anchors.find(a => {
+        try {
+          const u = new URL(a.href);
+          const segs = u.pathname.split('/').filter(Boolean);
+          const last = segs[segs.length - 1] || '';
+          // Article URLs are deep and carry long slugs — a real feedback
+          // page is shallow (/feedback, /ar/survey, …).
+          return segs.length <= 3 && last.length <= 40;
+        } catch { return false; }
+      });
+      return plausible ? plausible.href : null;
+    });
+
     let formInfo = { formFields: 0, hasEmbed: false, hasRatingUI: false, hasSurveyDialog: false, checked: false };
     let evidenceCaptured = false;
     let openMethod = '';
 
-    // Preferred path: OPEN the feedback destination and screenshot the actual
-    // form/modal (distinct from Q17, which only highlights the link).
-    if (feedbackHref) {
+    if (feedbackHref && recorder) {
+      // On camera: click the feedback link and let the form open on the
+      // recorded page (q17.png shows the ACTUAL form/modal).
+      try {
+        await recorder.setCaption('Q17 — Opening the feedback form…');
+        dbg(`Q17: opening feedback form on camera: ${feedbackHref}`);
+        const u = new URL(feedbackHref);
+        const anchor = page
+          .locator(`a[href="${feedbackHref}"], a[href="${u.pathname + u.search}"]`)
+          .first();
+        if (await anchor.isVisible().catch(() => false)) {
+          await anchor.evaluate(el => { (el as HTMLAnchorElement).target = '_self'; }).catch(() => {});
+          await anchor.scrollIntoViewIfNeeded().catch(() => {});
+          await clickWithHighlight(anchor, { holdMs: 1000, timeout: 5000 });
+          try { await page.waitForLoadState('networkidle', { timeout: 8000 }); } catch { /* */ }
+        } else {
+          await navigateAndWait(page, feedbackHref);
+        }
+        // Survey modals (e.g. TAMM's "Rate Your Experience") open after a delay
+        await page.waitForTimeout(4000);
+        await dismissCookieBanner(page);
+        navigatedAway = true;
+        formInfo = { ...(await page.evaluate(inspectFeedbackForm)), checked: true };
+        await recorder.setCaption('Q17 — Feedback form opened — reviewing it…');
+        await viewportShot(page, ss17.abs);
+        evidenceCaptured = true;
+        openMethod = 'opened via feedback link';
+        dbg(`Q17: form opened — ${formInfo.formFields} fields${formInfo.hasRatingUI ? ', rating widget' : ''}${formInfo.hasSurveyDialog ? ', survey dialog' : ''}`);
+        await humanScrollVerify(page, { maxSteps: 2, delayMs: 300 });
+      } catch {
+        dbg('Q17: on-camera form open failed — falling back');
+      }
+    } else if (feedbackHref) {
+      // Fast path (non-recorded): inspect the form in a background tab.
       const fp = await page.context().newPage();
       try {
         await fp.goto(feedbackHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        // Survey modals (e.g. TAMM's "Rate Your Experience") open after a delay
         await fp.waitForTimeout(4000);
         await dismissCookieBanner(fp);
         await fp.waitForTimeout(500);
         formInfo = { ...(await fp.evaluate(inspectFeedbackForm)), checked: true };
-        await viewportShot(fp, ss.abs);
+        await viewportShot(fp, ss17.abs);
         evidenceCaptured = true;
         openMethod = 'opened via feedback link';
       } catch { /* fall through to click path */ } finally {
@@ -559,28 +1004,78 @@ async function checkQ17_1(page: Page, auditJobId: string, q17Passed: boolean): P
       }
     }
 
-    // Fallback: no link — click the in-page feedback control to open its
-    // widget/modal, then screenshot the result.
+    // Fallback: no link (or the link path failed) — click the in-page
+    // feedback control to open its widget/modal on the current page.
     if (!evidenceCaptured) {
-      let clicked = false;
-      for (const sel of FEEDBACK_SELECTORS) {
-        const loc = page.locator(sel).first();
-        if (await loc.isVisible().catch(() => false)) {
-          try {
-            await loc.click({ timeout: 2000 });
-            clicked = true;
-            await page.waitForTimeout(2500);
-            break;
-          } catch { /* try next */ }
+      const urlBefore = page.url();
+      // Pick a PLAUSIBLE control only: a widget element, or an anchor whose
+      // text says feedback/survey — bare href-substring anchors are often
+      // news articles ("…mapping survey…") and must not be clicked.
+      const hasCandidate = await page.evaluate(() => {
+        const kwRe = /feedback|survey|satisfaction|ملاحظات|تقييم|استبيان|رأيك/i;
+        const sels = [
+          'a[href*="feedback" i]', 'a[href*="survey" i]', 'a[href*="satisfaction" i]',
+          '[class*="feedback"]', '[id*="feedback"]', '[class*="survey"]', '[id*="survey"]',
+        ];
+        for (const sel of sels) {
+          for (const el of Array.from(document.querySelectorAll(sel))) {
+            const r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) continue;
+            if (el.tagName === 'A') {
+              const a = el as HTMLAnchorElement;
+              if (!kwRe.test((a.textContent || '').trim())) {
+                try {
+                  const u = new URL(a.href);
+                  const segs = u.pathname.split('/').filter(Boolean);
+                  const last = segs[segs.length - 1] || '';
+                  if (segs.length > 3 || last.length > 40) continue; // article-like URL
+                } catch { continue; }
+              }
+            }
+            el.setAttribute('data-sitecheck-fbctl', '1');
+            return true;
+          }
         }
+        return false;
+      }).catch(() => false);
+
+      let clicked = false;
+      if (hasCandidate) {
+        const loc = page.locator('[data-sitecheck-fbctl]').first();
+        try {
+          await recorder?.setCaption('Q17 — Opening the feedback option…');
+          dbg('Q17: clicking in-page feedback control…');
+          if (recorder) await clickWithHighlight(loc, { holdMs: 1000, timeout: 2000 });
+          else await loc.click({ timeout: 2000 });
+          clicked = true;
+          modalOpened = true;
+          await page.waitForTimeout(2500);
+        } catch {
+          dbg('Q17: in-page feedback control not clickable');
+        }
+        await page.evaluate(() => {
+          for (const el of Array.from(document.querySelectorAll('[data-sitecheck-fbctl]'))) {
+            el.removeAttribute('data-sitecheck-fbctl');
+          }
+        }).catch(() => { /* page may have navigated */ });
       }
       await dismissCookieBanner(page);
       await page.waitForTimeout(300);
+      if (page.url() !== urlBefore) {
+        // The control was a link after all — restore via navigation, not Escape.
+        navigatedAway = true;
+        modalOpened = false;
+      }
       if (clicked) {
         formInfo = { ...(await page.evaluate(inspectFeedbackForm)), checked: true };
         openMethod = 'opened via in-page feedback control';
+        await recorder?.setCaption('Q17 — Feedback form opened — reviewing it…');
+      } else if (recorder) {
+        dbg('Q17: no clickable feedback control found');
+        await recorder.setCaption('Q17 — Feedback indicators found, but no feedback form could be opened');
+        await page.waitForTimeout(1200);
       }
-      await viewportShot(page, ss.abs);
+      await viewportShot(page, ss17.abs);
       evidenceCaptured = true;
     }
 
@@ -599,37 +1094,96 @@ async function checkQ17_1(page: Page, auditJobId: string, q17Passed: boolean): P
       : ' Could not open the feedback form to inspect it.';
 
     if (findability.prominent && completable) {
-      return makeResult('Q17.1', {
+      q17_1 = makeResult('Q17.1', {
         scoreEarned: 1,
         status: 'pass',
-        screenshotPath: ss.rel,
-        notes: `Feedback is easy to find (${findability.how}) and complete.${formNote}`,
+        screenshotPath: ss171.rel,
+        notes: `Feedback is easy to find (${findability.how}) and complete.${formNote}${stampNote()}`,
         recommendation: '',
       });
+    } else {
+      q17_1 = makeResult('Q17.1', {
+        scoreEarned: 0,
+        status: 'fail',
+        screenshotPath: ss171.rel,
+        notes: `Feedback found but not easy to find/complete — ${findability.how}.${formNote}${stampNote()}`,
+      });
     }
-    return makeResult('Q17.1', {
-      scoreEarned: 0,
-      status: 'fail',
-      screenshotPath: ss.rel,
-      notes: `Feedback found but not easy to find/complete — ${findability.how}.${formNote}`,
-    });
   } catch (err: unknown) {
-    return makeResult('Q17.1', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
+    q17_1 = makeResult('Q17.1', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
   }
+
+  // Restore homepage state for the next checks (Q18 shoots the homepage).
+  if (modalOpened) {
+    try { await page.keyboard.press('Escape'); await page.waitForTimeout(500); } catch { /* */ }
+  }
+  if (navigatedAway) {
+    dbg('Q17: restoring homepage');
+    await navigateAndWait(page, url, { waitAfter: 1500 });
+    await dismissCookieBanner(page);
+  }
+
+  return { q17, q17_1 };
 }
 
 // ────────────────────────────────────────────────────────────
 //  Q18 — Clear Menu Labels [1/0]
 // ────────────────────────────────────────────────────────────
-async function checkQ18(page: Page, auditJobId: string): Promise<CriterionResult> {
+async function checkQ18(
+  page: Page, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<CriterionResult> {
   try {
+    await recorder?.setCaption('Q18 — Reviewing the main menu categories…');
+
+    // Open the burger drawer FIRST (both modes, so grading sees the real
+    // menu): sites like ADMO keep the whole navigation behind it, and the
+    // drawer markup often lives outside <nav>/<header> wrappers.
+    let openedMenu = false;
+    const visibleNavLinks = await page.evaluate(() => {
+      let n = 0;
+      for (const a of Array.from(document.querySelectorAll('nav a, header a, [role="navigation"] a, [role="menuitem"]'))) {
+        const r = a.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < window.innerHeight &&
+            r.left >= 0 && r.right <= window.innerWidth) n++;
+      }
+      return n;
+    }).catch(() => 0);
+    if (visibleNavLinks < 3) {
+      await recorder?.setCaption('Q18 — Navigation is behind a menu; opening it…');
+      dbg('Q18: navigation hidden — opening the burger menu');
+      openedMenu = await openNavMenu(page, { holdMs: recorder ? 1000 : 100 });
+    }
+
+    // Grade the menu labels and tag them for the evidence shot in one pass.
+    // When nav-scoped selectors find almost nothing (drawer markup outside
+    // <nav>/<header>), fall back to visible in-viewport internal links with
+    // menu-length (≤50 chars) text.
     const data = await page.evaluate(() => {
-      const navItems = Array.from(
-        document.querySelectorAll('nav a, header a, [role="navigation"] a, [role="menuitem"]'),
-      );
-      const labels = navItems
+      const toLabels = (els: Element[]) => els
         .map((el) => (el as HTMLElement).textContent?.trim() ?? '')
         .filter((t) => t.length > 0);
+
+      let labelEls = Array.from(
+        document.querySelectorAll('nav a, header a, [role="navigation"] a, [role="menuitem"]'),
+      );
+      let labels = toLabels(labelEls);
+      if (labels.length < 3) {
+        const orig = location.origin;
+        const fallbackEls = Array.from(document.querySelectorAll('a[href]')).filter((a) => {
+          const href = (a as HTMLAnchorElement).href;
+          if (!href.startsWith(orig)) return false;
+          const text = (a as HTMLElement).textContent?.trim() ?? '';
+          if (!text || text.length > 50) return false;
+          const r = a.getBoundingClientRect();
+          return r.width > 1 && r.height > 1 && r.top >= 0 && r.top < window.innerHeight &&
+            r.left >= 0 && r.right <= window.innerWidth;
+        });
+        const fallbackLabels = toLabels(fallbackEls);
+        if (fallbackLabels.length > labels.length) {
+          labelEls = fallbackEls;
+          labels = fallbackLabels;
+        }
+      }
 
       const vagueTerms = [
         'miscellaneous', 'other', 'more', 'stuff', 'click here', 'link',
@@ -641,6 +1195,21 @@ async function checkQ18(page: Page, auditJobId: string): Promise<CriterionResult
       const tooShort = labels.filter((l) => l.length === 1);
       const tooLong = labels.filter((l) => l.length > 50);
 
+      // Tag up to 8 visible, uniquely-labeled items for the evidence shot.
+      const seen = new Set<string>();
+      let count = 0;
+      for (const a of labelEls) {
+        if (count >= 8) break;
+        const text = (a as HTMLElement).textContent?.trim() ?? '';
+        if (!text || seen.has(text.toLowerCase())) continue;
+        const r = a.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2 || r.right <= 0 || r.left >= window.innerWidth ||
+            r.bottom <= 0 || r.top >= window.innerHeight) continue;
+        seen.add(text.toLowerCase());
+        a.setAttribute('data-sitecheck-menuitem', '1');
+        count++;
+      }
+
       return {
         totalLabels: labels.length,
         vagueCount: vagueLabels.length,
@@ -651,22 +1220,35 @@ async function checkQ18(page: Page, auditJobId: string): Promise<CriterionResult
     });
 
     const ss = ssPath(auditJobId, '18');
-    await takeHighlightedScreenshot(page, ss.abs, ['nav', 'header nav', '[role="navigation"]', 'header'], {
-      contextualZoom: true,
-      label: 'Main Menu',
+    await takeMultiHighlightScreenshot(page, ss.abs, [
+      { selector: '[data-sitecheck-menuitem]', label: 'Menu Categories' },
+    ], {
+      holdMs: recorder ? 2000 : 400,
+      maxBox: { width: 400, height: 100 },
     });
+    await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll('[data-sitecheck-menuitem]'))) {
+        el.removeAttribute('data-sitecheck-menuitem');
+      }
+    }).catch(() => { /* evidence only */ });
+    if (openedMenu) {
+      // Close the drawer so later checks' shots aren't covered by it.
+      try { await page.keyboard.press('Escape'); await page.waitForTimeout(500); } catch { /* */ }
+    }
 
     const passed =
       data.totalLabels > 0 &&
       data.vagueCount === 0 &&
       data.tooShort === 0 &&
       data.tooLong === 0;
+    dbg(`Q18: ${data.totalLabels} menu labels (vague ${data.vagueCount}, short ${data.tooShort}, long ${data.tooLong}) → ${passed ? 'pass' : 'fail'}`);
 
+    const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
     return makeResult('Q18', {
       scoreEarned: passed ? 1 : 0,
       status: data.totalLabels === 0 ? 'fail' : passed ? 'pass' : 'fail',
       screenshotPath: ss.rel,
-      notes: `Menu items: ${data.totalLabels}. Vague labels: ${data.vagueCount}${data.vagueLabels.length ? ' (' + data.vagueLabels.join(', ') + ')' : ''}. Too short: ${data.tooShort}. Too long: ${data.tooLong}.`,
+      notes: `Menu items: ${data.totalLabels}. Vague labels: ${data.vagueCount}${data.vagueLabels.length ? ' (' + data.vagueLabels.join(', ') + ')' : ''}. Too short: ${data.tooShort}. Too long: ${data.tooLong}.${openedMenu ? ' Menu categories shown via the navigation drawer.' : ''}${stampNote}`,
       recommendation: passed ? '' : getRecommendation('Q18'),
     });
   } catch (err: unknown) {
@@ -677,7 +1259,9 @@ async function checkQ18(page: Page, auditJobId: string): Promise<CriterionResult
 // ────────────────────────────────────────────────────────────
 //  Q19 — Content Free from Jargon [1/0]
 // ────────────────────────────────────────────────────────────
-async function checkQ19(page: Page, auditJobId: string): Promise<CriterionResult> {
+async function checkQ19(
+  page: Page, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<CriterionResult> {
   try {
     const data = await page.evaluate(() => {
       const text = document.body.innerText.toLowerCase();
@@ -691,17 +1275,27 @@ async function checkQ19(page: Page, auditJobId: string): Promise<CriterionResult
       return { jargonFound: found, wordCount };
     });
 
+    if (recorder) {
+      // Review the content on camera the way a human reader would.
+      // Homepage-only by design — Q13 already tours internal pages on this
+      // pillar's video, so this keeps the recording bounded.
+      await recorder.setCaption('Q19 — Scrolling through the page to review content for jargon and plain language…');
+      dbg('Q19: scrolling through the page content');
+      await humanScrollVerify(page, { maxSteps: 6 });
+    }
+
     const ss = ssPath(auditJobId, '19');
     await viewportShot(page, ss.abs);
 
     const jargonRatio = data.wordCount > 0 ? data.jargonFound.length / data.wordCount : 0;
     const passed = data.jargonFound.length <= 2 && jargonRatio < 0.001;
 
+    const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
     return makeResult('Q19', {
       scoreEarned: passed ? 1 : 0,
       status: passed ? 'pass' : 'fail',
       screenshotPath: ss.rel,
-      notes: `Jargon terms found: ${data.jargonFound.length}${data.jargonFound.length ? ' (' + data.jargonFound.join(', ') + ')' : ''}. Total words: ${data.wordCount}.`,
+      notes: `Jargon terms found: ${data.jargonFound.length}${data.jargonFound.length ? ' (' + data.jargonFound.join(', ') + ')' : ''}. Total words: ${data.wordCount}.${stampNote}`,
       recommendation: passed ? '' : getRecommendation('Q19'),
     });
   } catch (err: unknown) {
@@ -712,7 +1306,9 @@ async function checkQ19(page: Page, auditJobId: string): Promise<CriterionResult
 // ────────────────────────────────────────────────────────────
 //  Q20 — Clear Buttons and Links [1/0]
 // ────────────────────────────────────────────────────────────
-async function checkQ20(page: Page, auditJobId: string): Promise<CriterionResult> {
+async function checkQ20(
+  page: Page, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<CriterionResult> {
   try {
     const data = await page.evaluate(() => {
       const anchors = Array.from(document.querySelectorAll('a'));
@@ -742,18 +1338,50 @@ async function checkQ20(page: Page, auditJobId: string): Promise<CriterionResult
       };
     });
 
+    // Evidence: outline representative clearly-labeled controls (prefer the
+    // ones already in view — header/hero buttons) rather than a bare page shot.
+    await page.evaluate(() => {
+      const vague = ['click here', 'here', 'read more', 'more', 'link', 'اضغط هنا', 'هنا'];
+      const seen = new Set<string>();
+      const scored: { el: Element; inVp: number; top: number }[] = [];
+      for (const el of Array.from(document.querySelectorAll('button, [role="button"], a'))) {
+        const text = (el as HTMLElement).textContent?.trim() ?? '';
+        if (text.length < 3 || text.length > 30) continue;
+        if (vague.includes(text.toLowerCase()) || seen.has(text.toLowerCase())) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2 || r.right <= 0 || r.left >= window.innerWidth) continue;
+        seen.add(text.toLowerCase());
+        scored.push({ el, inVp: r.top >= 0 && r.bottom <= window.innerHeight ? 0 : 1, top: r.top });
+      }
+      scored.sort((a, b) => a.inVp - b.inVp || a.top - b.top);
+      for (const s of scored.slice(0, 5)) s.el.setAttribute('data-sitecheck-clearbtn', '1');
+    }).catch(() => { /* evidence only */ });
+
+    await recorder?.setCaption('Q20 — Highlighting clearly labeled buttons and links…');
+    dbg('Q20: highlighting representative labeled controls');
     const ss = ssPath(auditJobId, '20');
-    await viewportShot(page, ss.abs);
+    await takeMultiHighlightScreenshot(page, ss.abs, [
+      { selector: '[data-sitecheck-clearbtn]', label: 'Clearly Labeled Controls' },
+    ], {
+      holdMs: recorder ? 2000 : 400,
+      maxBox: { width: 450, height: 120 },
+    });
+    await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll('[data-sitecheck-clearbtn]'))) {
+        el.removeAttribute('data-sitecheck-clearbtn');
+      }
+    }).catch(() => { /* evidence only */ });
 
     const vagueRatio = data.totalLinks > 0 ? data.vagueLinks / data.totalLinks : 0;
     const emptyButtonRatio = data.totalButtons > 0 ? data.emptyButtons / data.totalButtons : 0;
     const passed = vagueRatio <= 0.15 && emptyButtonRatio <= 0.1;
 
+    const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
     return makeResult('Q20', {
       scoreEarned: passed ? 1 : 0,
       status: passed ? 'pass' : 'fail',
       screenshotPath: ss.rel,
-      notes: `Links: ${data.totalLinks} (vague: ${data.vagueLinks}). Buttons: ${data.totalButtons} (empty: ${data.emptyButtons}).`,
+      notes: `Links: ${data.totalLinks} (vague: ${data.vagueLinks}). Buttons: ${data.totalButtons} (empty: ${data.emptyButtons}).${stampNote}`,
       recommendation: passed ? '' : getRecommendation('Q20'),
     });
   } catch (err: unknown) {
@@ -917,8 +1545,65 @@ async function checkQ21(
 //  Available and easy to find [2] / available but not easy [1] / none [0]
 //  Easy to find = an FAQ link in the header/nav/footer of the homepage.
 // ────────────────────────────────────────────────────────────
-async function checkQ22(page: Page, auditJobId: string): Promise<CriterionResult> {
+// Evidence selectors for a shot of the FAQ section itself (after expansion).
+const FAQ_SECTION_SHOT_SELECTORS = [
+  'h1:has-text("Frequently Asked")', 'h2:has-text("Frequently Asked")',
+  'h1:has-text("الأسئلة الشائعة")', 'h2:has-text("الأسئلة الشائعة")',
+  '[class*="faq" i]', '[id*="faq" i]', '[class*="accordion" i]',
+];
+
+// Open (expand) up to `max` FAQ questions so the answers are visible — on
+// camera for recorded runs. Falls back to a read-through scroll when the FAQ
+// is plain text with nothing to expand. Best-effort, returns questions viewed.
+async function viewFaqQuestions(pageCtx: Page, recorder?: EvidenceRecorder, max = 2): Promise<number> {
+  let viewed = 0;
   try {
+    const toggleSelectors = [
+      'details > summary',
+      '[class*="faq" i] [aria-expanded="false"]',
+      '[class*="accordion" i] [aria-expanded="false"]',
+      '[class*="faq" i] button', '[class*="accordion" i] button',
+      '[aria-expanded="false"]',
+    ];
+    const seenTexts = new Set<string>();
+    for (const sel of toggleSelectors) {
+      if (viewed >= max) break;
+      const candidates = await pageCtx.locator(sel).all().catch(() => []);
+      for (const cand of candidates.slice(0, 12)) {
+        if (viewed >= max) break;
+        const text = ((await cand.textContent().catch(() => '')) || '').trim();
+        // Question-length text only — skips nav toggles and icon buttons.
+        if (text.length < 10 || text.length > 150) continue;
+        const key = text.toLowerCase();
+        if (seenTexts.has(key)) continue;
+        const box = await cand.boundingBox().catch(() => null);
+        if (!box || box.width < 2 || box.height < 2) continue;
+        try {
+          await recorder?.setCaption(`Q22 — Reading FAQ question ${viewed + 1}…`);
+          dbg(`Q22: expanding FAQ question ${viewed + 1}/${max}: "${text.slice(0, 60)}"`);
+          await cand.scrollIntoViewIfNeeded().catch(() => {});
+          await clickWithHighlight(cand, { holdMs: recorder ? 1000 : 200, timeout: 3000 });
+          await pageCtx.waitForTimeout(recorder ? 1000 : 300);
+          seenTexts.add(key);
+          viewed++;
+        } catch { /* try the next candidate */ }
+      }
+    }
+    if (viewed === 0) {
+      await recorder?.setCaption('Q22 — Reviewing the FAQ questions…');
+      dbg('Q22: no expandable FAQ items — scrolling through the section');
+      await humanScrollVerify(pageCtx, { maxSteps: 4 });
+    }
+  } catch { /* evidence only — never affects the score */ }
+  return viewed;
+}
+
+async function checkQ22(
+  page: Page, url: string, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<CriterionResult> {
+  try {
+    await recorder?.setCaption('Q22 — Looking for an FAQ section…');
+    dbg('Q22: scanning for FAQ links/sections…');
     const data = await page.evaluate(() => {
       const isFaqLink = (a: Element) => {
         const href = (a.getAttribute('href') || '').toLowerCase();
@@ -931,6 +1616,8 @@ async function checkQ22(page: Page, auditJobId: string): Promise<CriterionResult
         document.querySelectorAll('header a, nav a, footer a, [role="banner"] a, [role="navigation"] a, [role="contentinfo"] a')
       );
       const inNav = navAnchors.some(isFaqLink);
+      const faqAnchor = (navAnchors.find(isFaqLink) ??
+        Array.from(document.querySelectorAll('a')).find(isFaqLink)) as HTMLAnchorElement | undefined;
 
       // FAQ is often hosted under a Support/Help section of the site
       const supportAnchor = navAnchors.find(a => {
@@ -948,12 +1635,47 @@ async function checkQ22(page: Page, auditJobId: string): Promise<CriterionResult
         text.includes('frequently asked') || text.includes('faq') ||
         text.includes('الأسئلة الشائعة') || text.includes('أسئلة متكررة');
 
-      return { inNav, supportHref: supportAnchor?.href ?? null, anyFaqLink, faqSections, hasFaqText };
+      return {
+        inNav,
+        faqHref: faqAnchor?.href ?? null,
+        supportHref: supportAnchor?.href ?? null,
+        anyFaqLink, faqSections, hasFaqText,
+      };
     });
 
     const ss = ssPath(auditJobId, '22');
+    const stampNote = () => (recorder ? ` [${recorder.stamp()}]` : '');
+    const viewedNote = (n: number) => n > 0
+      ? ` Viewed ${n} FAQ question(s).`
+      : (recorder ? ' FAQ shown as plain text — read through on camera.' : '');
+    const restoreHome = async () => {
+      dbg('Q22: restoring homepage');
+      await navigateAndWait(page, url, { waitAfter: 1500 });
+      await dismissCookieBanner(page);
+    };
 
     if (data.inNav) {
+      if (recorder && data.faqHref) {
+        // On camera: open the FAQ page and read at least two questions.
+        dbg(`Q22: FAQ link in navigation — opening ${data.faqHref}`);
+        await recorder.setCaption('Q22 — FAQ link found in the navigation — opening it…');
+        await humanNavigate(page, data.faqHref, recorder);
+        await dismissCookieBanner(page);
+        const viewed = await viewFaqQuestions(page, recorder);
+        await takeHighlightedScreenshot(page, ss.abs, FAQ_SECTION_SHOT_SELECTORS, {
+          contextualZoom: true,
+          label: 'FAQ Section',
+        });
+        const result = makeResult('Q22', {
+          scoreEarned: 2,
+          status: 'pass',
+          screenshotPath: ss.rel,
+          notes: `FAQ link available in the header/navigation/footer — easy to find.${viewedNote(viewed)}${stampNote()}`,
+          recommendation: '',
+        });
+        await restoreHome();
+        return result;
+      }
       await takeHighlightedScreenshot(page, ss.abs, [
         'header a[href*="faq" i]', 'nav a[href*="faq" i]', 'footer a[href*="faq" i]',
         'a[href*="faq" i]', 'a[href*="أسئلة"]', '[class*="faq" i]',
@@ -966,37 +1688,61 @@ async function checkQ22(page: Page, auditJobId: string): Promise<CriterionResult
         scoreEarned: 2,
         status: 'pass',
         screenshotPath: ss.rel,
-        notes: 'FAQ link available in the header/navigation/footer — easy to find.',
+        notes: `FAQ link available in the header/navigation/footer — easy to find.${stampNote()}`,
         recommendation: '',
       });
     }
 
     // No direct FAQ link — check the Support/Help section, where FAQ
     // commonly lives (e.g. TAMM's Support menu).
-    if (data.supportHref) {
+    const faqOnSupportEval = () => {
+      const text = document.body.innerText.toLowerCase();
+      const hasFaqText =
+        text.includes('frequently asked') || text.includes('faq') ||
+        text.includes('الأسئلة الشائعة') || text.includes('أسئلة متكررة');
+      const faqSections = document.querySelectorAll(
+        '[class*="faq" i], [id*="faq" i], details, [class*="accordion" i]'
+      ).length;
+      return { hasFaqText, faqSections };
+    };
+
+    if (data.supportHref && recorder) {
+      // On camera: open the Support page on the recorded page.
+      dbg(`Q22: opening support page ${data.supportHref}`);
+      await recorder.setCaption('Q22 — Opening the Support page to look for FAQs…');
+      await humanNavigate(page, data.supportHref, recorder);
+      await page.waitForTimeout(1500);
+      await dismissCookieBanner(page);
+      const faqOnSupport = await page.evaluate(faqOnSupportEval);
+      if (faqOnSupport.hasFaqText || faqOnSupport.faqSections > 0) {
+        dbg('Q22: FAQ found on the support page');
+        const viewed = await viewFaqQuestions(page, recorder);
+        await takeHighlightedScreenshot(page, ss.abs, FAQ_SECTION_SHOT_SELECTORS, {
+          contextualZoom: true,
+          label: 'FAQ Section',
+        });
+        const result = makeResult('Q22', {
+          scoreEarned: 2,
+          status: 'pass',
+          screenshotPath: ss.rel,
+          notes: `FAQ easily reachable via the Support/Help menu — FAQ section found on the support page.${viewedNote(viewed)}${stampNote()}`,
+          recommendation: '',
+        });
+        await restoreHome();
+        return result;
+      }
+      dbg('Q22: no FAQ on the support page');
+      await restoreHome();
+    } else if (data.supportHref) {
       const sp = await page.context().newPage();
       try {
         await sp.goto(data.supportHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await sp.waitForTimeout(3000);
         await dismissCookieBanner(sp);
-
-        const faqOnSupport = await sp.evaluate(() => {
-          const text = document.body.innerText.toLowerCase();
-          const hasFaqText =
-            text.includes('frequently asked') || text.includes('faq') ||
-            text.includes('الأسئلة الشائعة') || text.includes('أسئلة متكررة');
-          const faqSections = document.querySelectorAll(
-            '[class*="faq" i], [id*="faq" i], details, [class*="accordion" i]'
-          ).length;
-          return { hasFaqText, faqSections };
-        });
-
+        const faqOnSupport = await sp.evaluate(faqOnSupportEval);
         if (faqOnSupport.hasFaqText || faqOnSupport.faqSections > 0) {
-          await takeHighlightedScreenshot(sp, ss.abs, [
-            'h1:has-text("Frequently Asked")', 'h2:has-text("Frequently Asked")',
-            'h1:has-text("الأسئلة الشائعة")', 'h2:has-text("الأسئلة الشائعة")',
-            '[class*="faq" i]', '[id*="faq" i]', '[class*="accordion" i]',
-          ], {
+          const viewed = await viewFaqQuestions(sp, undefined);
+          await takeHighlightedScreenshot(sp, ss.abs, FAQ_SECTION_SHOT_SELECTORS, {
             contextualZoom: true,
             label: 'FAQ Section',
           });
@@ -1004,7 +1750,7 @@ async function checkQ22(page: Page, auditJobId: string): Promise<CriterionResult
             scoreEarned: 2,
             status: 'pass',
             screenshotPath: ss.rel,
-            notes: 'FAQ easily reachable via the Support/Help menu — FAQ section found on the support page.',
+            notes: `FAQ easily reachable via the Support/Help menu — FAQ section found on the support page.${viewedNote(viewed)}`,
             recommendation: '',
           });
         }
@@ -1013,6 +1759,14 @@ async function checkQ22(page: Page, auditJobId: string): Promise<CriterionResult
       }
     }
 
+    if (recorder) {
+      await recorder.setCaption(
+        data.anyFaqLink || data.faqSections > 0 || data.hasFaqText
+          ? 'Q22 — FAQ content exists but is not linked from the navigation'
+          : 'Q22 — No FAQ section found on this website',
+      );
+      await page.waitForTimeout(1200);
+    }
     await takeHighlightedScreenshot(page, ss.abs, [
       'a[href*="faq" i]', 'a[href*="أسئلة"]', '[class*="faq" i]',
     ], {
@@ -1026,14 +1780,14 @@ async function checkQ22(page: Page, auditJobId: string): Promise<CriterionResult
         scoreEarned: 1,
         status: 'partial',
         screenshotPath: ss.rel,
-        notes: `FAQ content exists but is not linked from the header/nav/footer or Support section — available but not easy to find. (Links: ${data.anyFaqLink ? 'yes' : 'no'}, sections: ${data.faqSections}, text: ${data.hasFaqText ? 'yes' : 'no'}.)`,
+        notes: `FAQ content exists but is not linked from the header/nav/footer or Support section — available but not easy to find. (Links: ${data.anyFaqLink ? 'yes' : 'no'}, sections: ${data.faqSections}, text: ${data.hasFaqText ? 'yes' : 'no'}.)${stampNote()}`,
       });
     }
     return makeResult('Q22', {
       scoreEarned: 0,
       status: 'fail',
       screenshotPath: ss.rel,
-      notes: 'No FAQ section, link, or related content found (homepage and Support section checked).',
+      notes: `No FAQ section, link, or related content found (homepage and Support section checked).${stampNote()}`,
     });
   } catch (err: unknown) {
     return makeResult('Q22', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
@@ -1124,32 +1878,41 @@ export default async function pillar4Navigation(params: {
   auditJobId: string;
   entityName: string;
   previousResults: CriterionResult[];
+  recorder?: EvidenceRecorder;
 }): Promise<CriterionResult[]> {
-  const { page, url, auditJobId } = params;
+  const { page, url, auditJobId, entityName, recorder } = params;
   const results: CriterionResult[] = [];
+
+  dbg(`starting Navigation pillar for "${entityName}" (${url})${recorder ? ' — recording' : ''}`);
+  await recorder?.setCaption(`Pillar 4 — Navigation & Ease of Use: automated check for "${entityName}"`);
+  if (recorder) await page.waitForTimeout(1200);
 
   // Clear cookie banners before any evidence screenshots
   await dismissCookieBanner(page);
 
-  results.push(await checkQ12(page, auditJobId));
+  results.push(await checkQ12(page, url, auditJobId, recorder));
 
-  const q13 = await checkQ13(page, url, auditJobId);
+  const q13 = await checkQ13(page, url, auditJobId, recorder);
   results.push(q13.result);
 
-  results.push(await checkQ16(page, auditJobId));
+  results.push(await checkQ16(page, url, auditJobId, recorder));
 
-  const q17 = await checkQ17(page, auditJobId);
-  results.push(q17);
-  results.push(await checkQ17_1(page, auditJobId, q17.status === 'pass'));
+  const fb = await runFeedbackJourney(page, url, auditJobId, recorder);
+  results.push(fb.q17, fb.q17_1);
 
-  results.push(await checkQ18(page, auditJobId));
-  results.push(await checkQ19(page, auditJobId));
-  results.push(await checkQ20(page, auditJobId));
-  results.push(await checkQ22(page, auditJobId));
+  results.push(await checkQ18(page, auditJobId, recorder));
+  results.push(await checkQ19(page, auditJobId, recorder));
+  results.push(await checkQ20(page, auditJobId, recorder));
+  results.push(await checkQ22(page, url, auditJobId, recorder));
 
   // Q21 and Q30 navigate away from the homepage — run them last
+  await recorder?.setCaption('Q21 — Testing the search with a real query…');
   results.push(await checkQ21(page, url, auditJobId, q13.hasSearch));
+  await recorder?.setCaption('Q30 — Testing browser back/forward navigation…');
   results.push(await checkQ30(page, url, auditJobId));
+
+  await recorder?.setCaption('Pillar 4 — Navigation checks complete');
+  if (recorder) await page.waitForTimeout(1500);
 
   return results;
 }
