@@ -46,6 +46,15 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Refuse to stack runs — each one launches its own headless Chrome
+    // (recorded pillars add a video-encoding context on top).
+    if (auditJob.status === 'running') {
+      return NextResponse.json(
+        { error: 'Audit is already running' },
+        { status: 409 }
+      );
+    }
+
     // Mark the job as running BEFORE returning so the results page's poll
     // has a reliable in-progress signal (runSinglePillar sets the final
     // complete/partial status when it finishes).

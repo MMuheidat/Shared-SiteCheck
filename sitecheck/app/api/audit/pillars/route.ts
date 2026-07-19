@@ -7,7 +7,9 @@ const PILLARS = [
   { name: 'Website Structure', nameAR: 'هيكل الموقع', index: 3 },
   { name: 'Navigation', nameAR: 'التنقل', index: 4 },
   { name: 'Registration', nameAR: 'التسجيل', index: 5 },
-  { name: 'Services', nameAR: 'الخدمات', index: 6 },
+  // Services is beta for now — excluded from "Run All Pillars" and the
+  // completeness check, still runnable individually.
+  { name: 'Services', nameAR: 'الخدمات', index: 6, beta: true },
   { name: 'Performance', nameAR: 'الأداء', index: 7 },
   { name: 'Customer Privacy', nameAR: 'خصوصية العملاء', index: 8 },
   // Beta pillars: require LLM installation/integration — excluded from "Run All Pillars",

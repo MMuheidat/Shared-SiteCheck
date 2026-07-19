@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useSession } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
@@ -16,7 +16,6 @@ import {
   ClipboardList,
   Loader2,
   Eye,
-  Zap,
 } from 'lucide-react';
 import { SkeletonCard } from '@/components/Skeleton';
 import { useToast } from '@/components/Toast';
@@ -48,7 +47,6 @@ export default function DashboardPage() {
   const [audits, setAudits] = useState<AuditJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [startingTamm, setStartingTamm] = useState(false);
 
   useEffect(() => {
     if (false) {
@@ -56,11 +54,7 @@ export default function DashboardPage() {
     }
   }, [status, router]);
 
-  useEffect(() => {
-    fetchAudits();
-  }, [status]);
-
-  const fetchAudits = async () => {
+  const fetchAudits = useCallback(async () => {
     try {
       const res = await fetch('/api/audit/list');
       if (res.ok) {
@@ -72,7 +66,13 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [showToast]);
+
+  useEffect(() => {
+    // Fetch-on-mount: all setState calls happen after await, not synchronously.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchAudits();
+  }, [status, fetchAudits]);
 
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this evaluation? This action cannot be undone.')) {
@@ -92,44 +92,6 @@ export default function DashboardPage() {
       showToast('Failed to delete evaluation', 'error');
     } finally {
       setDeletingId(null);
-    }
-  };
-
-  // One-click TAMM Automated Check: create an audit for the TAMM portal and
-  // immediately run all production pillars (1–8), then jump to the results page.
-  const handleTammCheck = async () => {
-    setStartingTamm(true);
-    try {
-      const createRes = await fetch('/api/audit/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          websiteUrl: 'https://www.tamm.abudhabi/',
-          entityName: 'TAMM - Abu Dhabi Government Services',
-          serviceName: '',
-        }),
-      });
-      if (!createRes.ok) {
-        const err = await createRes.json();
-        throw new Error(err.error || 'Failed to create TAMM audit');
-      }
-      const { id } = await createRes.json();
-
-      const runRes = await fetch('/api/audit/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ auditJobId: id }),
-      });
-      if (!runRes.ok) {
-        const err = await runRes.json();
-        throw new Error(err.error || 'Failed to start TAMM evaluation');
-      }
-
-      showToast('TAMM Automated Check started — running pillars 1–8.', 'success');
-      router.push(`/audit/${id}/results`);
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Failed to start TAMM check', 'error');
-      setStartingTamm(false);
     }
   };
 
@@ -163,19 +125,6 @@ export default function DashboardPage() {
           <p className="text-text-secondary mt-1">Manage and review your website evaluations</p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={handleTammCheck}
-            disabled={startingTamm}
-            className="btn-secondary"
-            title="Create and automatically run an evaluation of tamm.abudhabi (pillars 1–8)"
-          >
-            {startingTamm ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Zap className="w-4 h-4" />
-            )}
-            TAMM Automated Check
-          </button>
           <Link href="/audit/new" className="btn-primary">
             <PlusCircle className="w-4 h-4" />
             New Evaluation

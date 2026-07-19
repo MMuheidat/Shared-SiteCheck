@@ -41,8 +41,8 @@ export const PILLAR_CHECKS: Array<{
   { name: 'Accessibility & Inclusion', nameAR: 'إمكانية الوصول والشمولية', fn: pillar2Accessibility, record: 'pillar2' },
   { name: 'Website Structure', nameAR: 'هيكل الموقع', fn: pillar3Structure, record: 'pillar3' },
   { name: 'Navigation', nameAR: 'التنقل', fn: pillar4Navigation, record: 'pillar4' },
-  { name: 'Registration', nameAR: 'التسجيل', fn: pillar5Registration },
-  { name: 'Services', nameAR: 'الخدمات', fn: pillar6Services },
+  { name: 'Registration', nameAR: 'التسجيل', fn: pillar5Registration, record: 'pillar5' },
+  { name: 'Services', nameAR: 'الخدمات', fn: pillar6Services, beta: true },
   { name: 'Performance', nameAR: 'الأداء', fn: pillar7Performance },
   { name: 'Customer Privacy', nameAR: 'خصوصية العملاء', fn: pillar8Privacy },
   { name: 'Live Chat', nameAR: 'الدردشة المباشرة', fn: pillar9LiveChat, beta: true },
@@ -217,8 +217,8 @@ export async function runEvaluation(
     }
 
     // Wait for JavaScript-rendered content to stabilize (SPAs, dynamic content)
-    console.log('[SiteCheck] Waiting 10 seconds for page to fully render...');
-    await page.waitForTimeout(10000);
+    console.log('[SiteCheck] Waiting 4 seconds for page to fully render...');
+    await page.waitForTimeout(4000);
 
     // ── 6. Run pillar checks sequentially (non-beta pillars only) ──
     for (const pillar of activePillars) {
@@ -437,8 +437,8 @@ export async function runSinglePillar(
       }
     }
 
-    console.log('[SiteCheck] [Single Pillar] Waiting 10 seconds for page to render...');
-    await page.waitForTimeout(10000);
+    console.log('[SiteCheck] [Single Pillar] Waiting 4 seconds for page to render...');
+    await page.waitForTimeout(4000);
 
     // Fetch existing results from other pillars (for context / previousResults)
     const existingDbResults = await prisma.criterionResult.findMany({

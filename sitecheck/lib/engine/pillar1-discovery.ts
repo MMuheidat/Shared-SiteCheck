@@ -676,6 +676,7 @@ interface MapsValidation {
   isBusinessProfile: boolean;  // Are we on a real place profile (not a city page)?
   isGenericGeoPage: boolean;   // HARD FAIL: Is this a city/emirate/region page?
   entityNameVisible: boolean;  // Is the entity name visible?
+  hasLocation: boolean;        // Address entry / Directions present — the place has a physical location
   websiteField: string | null; // The website URL shown on the Maps profile
   websiteMatches: boolean;     // Does the website field match the audited URL?
   pageTitle: string;           // The visible title/heading on the Maps panel
@@ -784,6 +785,9 @@ async function validateMapsPage(
         document.querySelector('button[data-value="Directions"]') !== null ||
         document.querySelector('a[href*="dir/"]') !== null;
 
+      const hasAddressEntry = document.querySelector('[data-item-id="address"]') !== null;
+      const hasLocation = hasAddressEntry || hasDirectionsButton;
+
       const hasBusinessInfo = hasWebsiteElement || (hasPhoneElement && hasDirectionsButton);
 
       // ── Extract the website field ──
@@ -847,6 +851,7 @@ async function validateMapsPage(
         isBusinessProfile,
         isGenericGeoPage,
         entityNameVisible,
+        hasLocation,
         websiteField: isGenericGeoPage ? null : websiteField, // Discard website from geo pages
         websiteMatches: isGenericGeoPage ? false : websiteMatches,
         pageTitle,
@@ -863,39 +868,117 @@ const MAPS_WEBSITE_SELECTORS = [
   '.LrzXr',
 ];
 
-/**
- * One Google Maps search pass: open Maps, type the query like a person would
- * (direct /maps/search URL as fallback), open the best-matching result, and
- * validate the resulting panel. Validation always runs against `entityName`,
- * even when `query` is a refined variant.
- */
-async function searchMapsAndOpenProfile(
-  page: Page,
-  query: string,
-  entityName: string,
-  auditedHost: string | null,
-): Promise<MapsValidation> {
-  // Human-like flow: Maps home → type → Enter
+// Google A/B-tests the Maps frontend: the classic build has
+// input#searchboxinput; the current one an anonymous input[name="q"] with
+// role=combobox and a dynamic id. Cover both.
+const MAPS_SEARCHBOX_SELECTOR =
+  'input#searchboxinput, input[name="q"][role="combobox"], input[role="combobox"]';
+// Autocomplete suggestions render as rows of a role=grid container; the
+// clickable inner element is .DgCNMb (with a [role="gridcell"] fallback).
+const MAPS_SUGGESTION_ROW_SELECTOR = '[role="grid"] [role="row"]';
+
+function emptyMapsValidation(): MapsValidation {
+  return {
+    isBusinessProfile: false,
+    isGenericGeoPage: false,
+    entityNameVisible: false,
+    hasLocation: false,
+    websiteField: null,
+    websiteMatches: false,
+    pageTitle: '',
+  };
+}
+
+// Higher = closer to the criterion's pass condition; used to keep the best
+// attempt across suggestions/queries.
+function rankMapsValidation(v: MapsValidation): number {
+  if (v.isGenericGeoPage) return 0;
+  if (v.isBusinessProfile && v.websiteMatches && v.hasLocation) return 4;
+  if (v.isBusinessProfile && v.websiteMatches) return 3;
+  if (v.isBusinessProfile && v.websiteField) return 2;
+  if (v.isBusinessProfile) return 1;
+  return 0;
+}
+
+/** Open Maps (English UI — geolocation still biases suggestions to the UAE)
+ *  and type the query into the search box WITHOUT submitting. */
+async function typeMapsQuery(page: Page, query: string): Promise<boolean> {
   try {
-    if (!page.url().startsWith('https://www.google.com/maps')) {
-      await page.goto('https://www.google.com/maps', { waitUntil: 'domcontentloaded', timeout: 20000 });
-    }
+    await page.goto('https://www.google.com/maps?hl=en', { waitUntil: 'domcontentloaded', timeout: 20000 });
     await dismissSearchConsent(page);
-    const box = page.locator('input#searchboxinput').first();
+    const box = page.locator(MAPS_SEARCHBOX_SELECTOR).first();
     await box.waitFor({ state: 'visible', timeout: 6000 });
     await box.click({ timeout: 3000 });
     await box.evaluate((el: Element) => { (el as HTMLInputElement).value = ''; });
-    await box.pressSequentially(query, { delay: 25 });
-    await page.keyboard.press('Enter');
+    await box.pressSequentially(query, { delay: 60 });
+    return true;
   } catch {
-    // Fallback: direct search URL
-    const mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
-    await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => { /* */ });
-    await dismissSearchConsent(page);
+    return false;
   }
+}
 
-  // Wait for either a results feed or a place panel (selectors cover the
-  // localized/Arabic Maps UI variants too)
+/** Texts of the autocomplete suggestion rows currently shown (empty when none). */
+async function readMapsSuggestions(page: Page): Promise<string[]> {
+  try {
+    await page.waitForSelector(MAPS_SUGGESTION_ROW_SELECTOR, { timeout: 4000 });
+  } catch {
+    return [];
+  }
+  await page.waitForTimeout(500); // let the list settle while typing finishes
+  return page.evaluate(
+    (sel: string) =>
+      Array.from(document.querySelectorAll(sel)).map((r) => (r.textContent || '').trim()),
+    MAPS_SUGGESTION_ROW_SELECTOR,
+  );
+}
+
+/**
+ * Pick up to two suggestion indexes worth opening (the evaluator's "first or
+ * 2nd option"). Rows that just echo the typed query (plain-text search
+ * suggestions with no place address) are skipped; rows mentioning a UAE
+ * locality are preferred — the audited entities are UAE government bodies.
+ */
+function pickSuggestionCandidates(texts: string[], query: string): number[] {
+  const locality =
+    /abu dhabi|dubai|sharjah|ajman|fujairah|ras al khaimah|umm al quwain|al ain|united arab emirates|\buae\b|أبوظبي|أبو ظبي|دبي|الشارقة|الإمارات|street|\bst\b|road/i;
+  const q = query.trim().toLowerCase();
+  const withLocality: number[] = [];
+  const others: number[] = [];
+  texts.forEach((t, i) => {
+    const tl = t.trim().toLowerCase();
+    if (!tl || tl === q) return; // plain query echo — not a place
+    (locality.test(tl) ? withLocality : others).push(i);
+  });
+  return [...withLocality, ...others].slice(0, 2);
+}
+
+/** Wait for the place panel after opening a suggestion/result, then validate. */
+async function settleAndValidateMapsPlace(
+  page: Page,
+  entityName: string,
+  auditedHost: string | null,
+): Promise<MapsValidation> {
+  await page
+    .waitForSelector('a[data-item-id="authority"], [data-item-id="address"], h1.fontHeadlineLarge, h1', {
+      timeout: 8000,
+    })
+    .catch(() => { /* validated as-is below */ });
+  await page.waitForTimeout(1000);
+  return validateMapsPage(page, entityName, auditedHost);
+}
+
+/**
+ * Legacy path (no suggestions dropdown / no search box): results feed → open
+ * the FIRST result. Label-based matching is unreliable here: Maps often
+ * localizes result labels into Arabic while the entity name is Latin
+ * (e.g. "مركز خدمة متعاملين تم" for TAMM). A wrong pick is still caught by
+ * validateMapsPage (website-host check).
+ */
+async function openFirstFeedResultAndValidate(
+  page: Page,
+  entityName: string,
+  auditedHost: string | null,
+): Promise<MapsValidation> {
   await page
     .waitForSelector(
       'div[role="feed"], a.hfpxzc, div.Nv2PK, a[data-item-id="authority"], h1.fontHeadlineLarge',
@@ -903,25 +986,117 @@ async function searchMapsAndOpenProfile(
     )
     .catch(() => { /* */ });
   await page.waitForTimeout(800);
-
-  // If a results list is showing, open the FIRST result. Label-based matching
-  // is unreliable here: Maps often localizes result labels into Arabic while
-  // the entity name is Latin (e.g. "مركز خدمة متعاملين تم" for TAMM), so word
-  // scoring skips the genuine top result. A wrong first pick is still caught by
-  // validateMapsPage (website-host check) and the fallback re-search in checkQ3.
   try {
     const feedResults = page.locator('div[role="feed"] a.hfpxzc, a.hfpxzc, a[href*="/maps/place/"]');
-    const count = await feedResults.count();
-    if (count > 0) {
+    if ((await feedResults.count()) > 0) {
       await clickWithHighlight(feedResults.first(), { timeout: 5000, holdMs: 400 });
-      await page
-        .waitForSelector('a[data-item-id="authority"], h1.fontHeadlineLarge, h1', { timeout: 7000 })
-        .catch(() => { /* */ });
-      await page.waitForTimeout(500);
     }
   } catch { /* already on a place panel */ }
+  return settleAndValidateMapsPlace(page, entityName, auditedHost);
+}
 
-  return validateMapsPage(page, entityName, auditedHost);
+interface MapsSearchOutcome {
+  validation: MapsValidation;
+  /** The autocomplete suggestion that produced `validation` (null = feed/URL path). */
+  suggestion: string | null;
+  /** Whether the page currently shows the place `validation` describes. */
+  shownOnPage: boolean;
+}
+
+/**
+ * One query pass, the way the evaluator does it by hand: type the query into
+ * Google Maps, read the autocomplete filter, open the 1st suggestion — and
+ * when its place doesn't validate (no location / website mismatch), retype
+ * and try the 2nd. Returns the best validation across the attempts.
+ */
+async function searchMapsViaSuggestions(
+  page: Page,
+  query: string,
+  entityName: string,
+  auditedHost: string | null,
+  recorder?: EvidenceRecorder,
+): Promise<MapsSearchOutcome> {
+  let best: MapsSearchOutcome | null = null;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!(await typeMapsQuery(page, query))) {
+      // Search box missing entirely — last-resort direct search URL.
+      console.log('[SiteCheck] Q3 — Maps search box not found, using direct search URL');
+      const mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`;
+      await page.goto(mapsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => { /* */ });
+      await dismissSearchConsent(page);
+      const validation = await openFirstFeedResultAndValidate(page, entityName, auditedHost);
+      return { validation, suggestion: null, shownOnPage: true };
+    }
+
+    const rows = await readMapsSuggestions(page);
+    if (rows.length === 0) {
+      console.log('[SiteCheck] Q3 — No Maps suggestions appeared — submitting the query directly');
+      await page.keyboard.press('Enter');
+      const validation = await openFirstFeedResultAndValidate(page, entityName, auditedHost);
+      return { validation, suggestion: null, shownOnPage: true };
+    }
+    if (attempt === 0) {
+      console.log(
+        `[SiteCheck] Q3 — Maps suggestions for "${query}": ${rows.slice(0, 4).map((t) => `"${t}"`).join(' | ')}`,
+      );
+    }
+
+    const candidates = pickSuggestionCandidates(rows, query);
+    if (attempt >= candidates.length) break;
+    const idx = candidates[attempt];
+    const label = rows[idx];
+
+    console.log(`[SiteCheck] Q3 — Opening Maps suggestion ${attempt + 1}: "${label}"`);
+    await recorder?.setCaption(`Q3 — Selecting the Google Maps suggestion "${label}"…`);
+    try {
+      const row = page.locator(MAPS_SUGGESTION_ROW_SELECTOR).nth(idx);
+      const inner = row.locator('.DgCNMb, [role="gridcell"]').first();
+      const clickTarget = (await inner.count()) > 0 ? inner : row;
+      await clickWithHighlight(clickTarget, { timeout: 5000, holdMs: recorder ? 1000 : 300 });
+    } catch {
+      continue; // dropdown re-rendered under us — retype and try the next candidate
+    }
+
+    const validation = await settleAndValidateMapsPlace(page, entityName, auditedHost);
+    console.log(
+      `[SiteCheck] Q3 — Suggestion ${attempt + 1} validation: title="${validation.pageTitle}", ` +
+        `location=${validation.hasLocation}, website="${validation.websiteField}", matches=${validation.websiteMatches}`,
+    );
+
+    const outcome: MapsSearchOutcome = { validation, suggestion: label, shownOnPage: true };
+    if (!best || rankMapsValidation(validation) > rankMapsValidation(best.validation)) {
+      best = outcome;
+    } else {
+      best.shownOnPage = false; // a later, worse attempt replaced it on screen
+    }
+    if (validation.isBusinessProfile && validation.websiteMatches && validation.hasLocation) {
+      return outcome; // the evaluator's pass condition — done
+    }
+    if (attempt === 0 && candidates.length > 1) {
+      await recorder?.setCaption("Q3 — First suggestion didn't match — trying the next one…");
+    }
+  }
+
+  return best ?? { validation: emptyMapsValidation(), suggestion: null, shownOnPage: true };
+}
+
+/** Re-open a previously validated suggestion so the evidence screenshot shows
+ *  the place the notes describe. Best-effort — never changes the verdict. */
+async function reopenMapsSuggestion(page: Page, query: string, label: string): Promise<void> {
+  try {
+    if (!(await typeMapsQuery(page, query))) return;
+    const rows = await readMapsSuggestions(page);
+    const idx = rows.findIndex((t) => t === label);
+    if (idx < 0) return;
+    const row = page.locator(MAPS_SUGGESTION_ROW_SELECTOR).nth(idx);
+    const inner = row.locator('.DgCNMb, [role="gridcell"]').first();
+    await clickWithHighlight((await inner.count()) > 0 ? inner : row, { timeout: 5000, holdMs: 300 });
+    await page
+      .waitForSelector('a[data-item-id="authority"], [data-item-id="address"], h1', { timeout: 8000 })
+      .catch(() => { /* */ });
+    await page.waitForTimeout(800);
+  } catch { /* evidence consistency is best-effort */ }
 }
 
 async function checkQ3(
@@ -937,39 +1112,52 @@ async function checkQ3(
   const stamp = recorder ? ` [${recorder.stamp()}]` : '';
 
   try {
-    // Keyword-first: a bare entity name containing a geo token ("… Abu Dhabi …")
-    // makes Maps resolve the CITY page, wasting a visible search. The qualified
-    // query goes first; the short brand name (acronym) is the one fallback.
-    const primaryQuery = `${entityName} website`;
+    // The evaluator's manual flow: type the entity ACRONYM into Google Maps,
+    // let the autocomplete filter suggest places (geolocation biases these to
+    // Abu Dhabi / UAE), open the 1st — or failing that the 2nd — suggestion,
+    // and verify the place has a location and lists the official website.
+    // Entities Maps doesn't know by acronym get one retry with the full name.
     const effectiveAcronym = suppliedAcronym.trim() || deriveAcronym(entityName);
-    const fallbackQuery =
-      effectiveAcronym.toLowerCase() !== entityName.trim().toLowerCase()
-        ? effectiveAcronym
-        : `${entityName} office`;
+    const queries = [effectiveAcronym];
+    if (entityName.trim().toLowerCase() !== effectiveAcronym.toLowerCase()) {
+      queries.push(entityName.trim());
+    }
 
-    console.log(`[SiteCheck] Q3 — Searching Google Maps for: "${primaryQuery}"`);
-    await recorder?.setCaption(`Q3 — Google Maps: locating the business profile for "${entityName}"…`);
+    await recorder?.setCaption(`Q3 — Google Maps: searching for "${effectiveAcronym}"…`);
 
-    let validation = await searchMapsAndOpenProfile(page, primaryQuery, entityName, auditedHost);
-
-    // One short fallback when the first search resolved to a generic
-    // geographic page or no recognizable profile.
-    if (validation.isGenericGeoPage || !validation.isBusinessProfile) {
-      console.log(
-        `[SiteCheck] Q3 — First Maps search inconclusive ("${validation.pageTitle}"), retrying with "${fallbackQuery}"…`,
-      );
-      await recorder?.setCaption(`Q3 — Refining the Google Maps search…`);
-      const recheck = await searchMapsAndOpenProfile(page, fallbackQuery, entityName, auditedHost);
-      if (!recheck.isGenericGeoPage && recheck.isBusinessProfile) {
-        validation = recheck;
+    let validation = emptyMapsValidation();
+    let chosenSuggestion: string | null = null;
+    let chosenQuery = '';
+    let chosenShown = true;
+    for (const query of queries) {
+      console.log(`[SiteCheck] Q3 — Searching Google Maps for: "${query}"`);
+      const outcome = await searchMapsViaSuggestions(page, query, entityName, auditedHost, recorder);
+      if (rankMapsValidation(outcome.validation) > rankMapsValidation(validation)) {
+        validation = outcome.validation;
+        chosenSuggestion = outcome.suggestion;
+        chosenQuery = query;
+        chosenShown = outcome.shownOnPage;
+      } else if (chosenQuery && chosenQuery !== query) {
+        chosenShown = false; // a later, worse query replaced the winner on screen
       }
+      if (validation.isBusinessProfile && validation.websiteMatches && validation.hasLocation) break;
+      if (query === queries[0] && queries.length > 1) {
+        console.log('[SiteCheck] Q3 — Acronym search inconclusive — retrying with the full entity name…');
+        await recorder?.setCaption('Q3 — Refining the Google Maps search…');
+      }
+    }
+
+    // Make sure the screenshot shows the place the verdict describes.
+    if (chosenSuggestion && !chosenShown) {
+      await reopenMapsSuggestion(page, chosenQuery, chosenSuggestion);
     }
 
     console.log(
       `[SiteCheck] Q3 — Maps validation: ` +
         `title="${validation.pageTitle}", profile=${validation.isBusinessProfile}, ` +
-        `geoPage=${validation.isGenericGeoPage}, website="${validation.websiteField}", ` +
-        `matches=${validation.websiteMatches}`,
+        `geoPage=${validation.isGenericGeoPage}, location=${validation.hasLocation}, ` +
+        `website="${validation.websiteField}", matches=${validation.websiteMatches}` +
+        (chosenSuggestion ? `, suggestion="${chosenSuggestion}"` : ''),
     );
 
     // Geo page → HARD FAIL, plain screenshot as evidence
@@ -1056,17 +1244,34 @@ async function checkQ3(
       } catch { /* evidence choreography only */ }
     }
 
+    const suggestionNote = chosenSuggestion
+      ? ` Selected Maps suggestion: "${chosenSuggestion}".`
+      : '';
+
     // Determine result
-    if (validation.isBusinessProfile && validation.websiteMatches) {
-      // PASS — website field matches the official website
+    if (validation.isBusinessProfile && validation.websiteMatches && validation.hasLocation) {
+      // PASS — the place has a physical location and its website field matches
       return makeResult('Q3', {
         scoreEarned: 2,
         status: 'pass',
         screenshotPath: ss.rel,
         notes:
-          `Entity "${entityName}" found on Google Maps (profile: "${validation.pageTitle}"). ` +
-          `The website field ("${validation.websiteField}") matches the official website (${auditedHost}).${stamp}`,
+          `Entity "${entityName}" found on Google Maps (profile: "${validation.pageTitle}").` +
+          suggestionNote +
+          ` The place has a physical location listed and the website field ` +
+          `("${validation.websiteField}") matches the official website (${auditedHost}).${stamp}`,
         recommendation: '',
+      });
+    } else if (validation.isBusinessProfile && validation.websiteMatches && !validation.hasLocation) {
+      // FAIL — website matches but the listing shows no physical location
+      return makeResult('Q3', {
+        scoreEarned: 0,
+        status: 'fail',
+        screenshotPath: ss.rel,
+        notes:
+          `Entity "${entityName}" found on Google Maps (profile: "${validation.pageTitle}") and the ` +
+          `website field matches, but the listing shows no physical location (no address or ` +
+          `directions).${suggestionNote}${stamp}`,
       });
     } else if (validation.isBusinessProfile && validation.websiteField) {
       // FAIL — website field exists but shows a different URL
@@ -1075,8 +1280,9 @@ async function checkQ3(
         status: 'fail',
         screenshotPath: ss.rel,
         notes:
-          `Entity "${entityName}" found on Google Maps (profile: "${validation.pageTitle}"). ` +
-          `Incorrect website URL: the Maps listing shows "${validation.websiteField}" ` +
+          `Entity "${entityName}" found on Google Maps (profile: "${validation.pageTitle}").` +
+          suggestionNote +
+          ` Incorrect website URL: the Maps listing shows "${validation.websiteField}" ` +
           `instead of the official website (${auditedHost}).${stamp}`,
       });
     } else if (validation.isBusinessProfile && !validation.websiteField) {
@@ -1087,8 +1293,9 @@ async function checkQ3(
         screenshotPath: ss.rel,
         notes:
           `Entity "${entityName}" found on Google Maps (profile: "${validation.pageTitle}"), ` +
-          `but no website is listed on the profile. ` +
-          `No - Website is not mentioned on Google Maps.${stamp}`,
+          `but no website is listed on the profile.` +
+          suggestionNote +
+          ` No - Website is not mentioned on Google Maps.${stamp}`,
       });
     } else {
       // FAIL — entity not found or not on a proper business profile

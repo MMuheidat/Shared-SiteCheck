@@ -61,6 +61,21 @@ function getCriterionSubtitle(qid: string): string {
   return description.split(/\r?\n/)[0].trim();
 }
 
+// Pillar name → ordinal, mirroring PILLAR_CHECKS order in lib/engine/index.ts
+// (not imported to keep engine deps out of this client component).
+const PILLAR_NUMBERS: Record<string, number> = {
+  'Discovery & Access': 1,
+  'Accessibility & Inclusion': 2,
+  'Website Structure': 3,
+  'Navigation': 4,
+  'Registration': 5,
+  'Services': 6,
+  'Performance': 7,
+  'Customer Privacy': 8,
+  'Live Chat': 9,
+  'Enquiry Form Journey': 10,
+};
+
 export default function ResultsTable({ results, onScreenshotClick }: ResultsTableProps) {
   const [sortKey, setSortKey] = useState<SortKey>('qid');
   const [sortAsc, setSortAsc] = useState(true);
@@ -74,20 +89,6 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
     }
   };
 
-  // Pillar name → ordinal, mirroring PILLAR_CHECKS order in lib/engine/index.ts
-  // (not imported to keep engine deps out of this client component).
-  const PILLAR_NUMBERS: Record<string, number> = {
-    'Discovery & Access': 1,
-    'Accessibility & Inclusion': 2,
-    'Website Structure': 3,
-    'Navigation': 4,
-    'Registration': 5,
-    'Services': 6,
-    'Performance': 7,
-    'Customer Privacy': 8,
-    'Live Chat': 9,
-    'Enquiry Form Journey': 10,
-  };
   const pillarVideoLabel = (pillar: string) => {
     const n = PILLAR_NUMBERS[pillar];
     return n ? `Pillar ${n} Video — ${pillar}` : `${pillar} — Video`;
@@ -108,10 +109,15 @@ export default function ResultsTable({ results, onScreenshotClick }: ResultsTabl
       let cmp = 0;
       switch (sortKey) {
         case 'qid':
-          cmp = a.qid.localeCompare(b.qid, undefined, { numeric: true });
+          // Group by pillar ordinal first: raw numeric QID order would drop
+          // Q30 (Navigation) below Q23/Q24 (Registration) and split the
+          // pillar's video bar in two.
+          cmp = (PILLAR_NUMBERS[a.pillar] ?? 99) - (PILLAR_NUMBERS[b.pillar] ?? 99)
+             || a.qid.localeCompare(b.qid, undefined, { numeric: true });
           break;
         case 'pillar':
-          cmp = a.pillar.localeCompare(b.pillar) || a.qid.localeCompare(b.qid, undefined, { numeric: true });
+          cmp = (PILLAR_NUMBERS[a.pillar] ?? 99) - (PILLAR_NUMBERS[b.pillar] ?? 99)
+             || a.qid.localeCompare(b.qid, undefined, { numeric: true });
           break;
         case 'status':
           cmp = a.status.localeCompare(b.status);

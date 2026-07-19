@@ -76,8 +76,10 @@ export async function GET(
               sentResultCount = currentResults.length;
             }
 
-            // Check if audit is complete or failed
-            if (auditJob.status === 'complete' || auditJob.status === 'failed') {
+            // Check if the audit reached a terminal state ('partial' is
+            // terminal too — single-pillar runs and pending-enquiry jobs end
+            // there; without it this loop polls the DB until the 10-min cap).
+            if (auditJob.status === 'complete' || auditJob.status === 'partial' || auditJob.status === 'failed') {
               sendEvent({
                 type: 'audit_complete',
                 status: auditJob.status,

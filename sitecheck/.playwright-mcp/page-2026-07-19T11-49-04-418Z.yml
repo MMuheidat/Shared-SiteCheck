@@ -1,0 +1,123 @@
+- generic "Google Maps" [ref=e2]:
+  - generic [ref=e3]:
+    - application "Map · Use arrow keys to pan the map. · Get details about a place by pressing its corresponding number key." [ref=e8]
+    - generic [ref=e11]:
+      - search [ref=e14]:
+        - generic [ref=e15]:
+          - combobox [expanded] [active] [ref=e185]: TAMM
+          - button "Search" [ref=e20] [cursor=pointer]:
+            - generic [ref=e21]: 
+          - button "Directions" [ref=e23] [cursor=pointer]:
+            - generic [ref=e24]: 
+        - grid "Suggestions" [ref=e186]:
+          - row [ref=e189] [cursor=pointer]:
+            - gridcell "TAMM Factory Saif Ghobash Street - Abu Dhabi" [ref=e190]:
+              - generic [ref=e191]: 
+              - generic [ref=e193]: TAMM Factory
+              - generic [ref=e194]: Saif Ghobash Street - Abu Dhabi
+          - row [ref=e197] [cursor=pointer]:
+            - gridcell "TAMM Service Centre Abu Dhabi" [ref=e198]:
+              - generic [ref=e199]: 
+              - generic [ref=e201]: TAMM Service Centre
+              - generic [ref=e202]: Abu Dhabi
+          - row [ref=e205] [cursor=pointer]:
+            - gridcell "TAMM Service Center Abu Dhabi" [ref=e206]:
+              - generic [ref=e207]: 
+              - generic [ref=e209]: TAMM Service Center
+              - generic [ref=e210]: Abu Dhabi
+          - row [ref=e213] [cursor=pointer]:
+            - gridcell "tamm" [ref=e214]:
+              - generic [ref=e215]: 
+          - row [ref=e220] [cursor=pointer]:
+            - gridcell "Tammam and Ghazal Abu Dhabi" [ref=e221]:
+              - generic [ref=e222]: 
+              - generic [ref=e224]: Tammam and Ghazal
+              - generic [ref=e225]: Abu Dhabi
+      - region "Al Reem Island" [ref=e56]:
+        - generic [ref=e57]:
+          - heading "Al Reem Island" [level=1] [ref=e59]
+          - group "Al Reem Island weather" [ref=e60]:
+            - generic [ref=e61]: 38°
+            - img "Sunny" [ref=e62]
+        - region "Traffic" [ref=e63]:
+          - button "Heavy traffic in this area Much slower than usual" [ref=e64] [cursor=pointer]:
+            - generic [ref=e67]:
+              - generic [ref=e68]: Heavy traffic in this area
+              - generic [ref=e69]: Much slower than usual
+            - generic [ref=e70]: 
+    - region "Available search options for this area" [ref=e77]:
+      - generic [ref=e80]:
+        - button "Restaurants" [ref=e82] [cursor=pointer]:
+          - generic [ref=e83]:
+            - generic [ref=e85]: 
+            - generic [ref=e86]: Restaurants
+        - button "Hotels" [ref=e88] [cursor=pointer]:
+          - generic [ref=e89]:
+            - generic [ref=e91]: 
+            - generic [ref=e92]: Hotels
+        - button "Things to do" [ref=e94] [cursor=pointer]:
+          - generic [ref=e95]:
+            - generic [ref=e97]: 
+            - generic [ref=e98]: Things to do
+        - button "Museums" [ref=e100] [cursor=pointer]:
+          - generic [ref=e101]:
+            - generic [ref=e103]: 
+            - generic [ref=e104]: Museums
+        - button "Transit" [ref=e106] [cursor=pointer]:
+          - generic [ref=e107]:
+            - generic [ref=e109]: 
+            - generic [ref=e110]: Transit
+        - button "Pharmacies" [ref=e112] [cursor=pointer]:
+          - generic [ref=e113]:
+            - generic [ref=e115]: 
+            - generic [ref=e116]: Pharmacies
+        - button "ATMs" [ref=e118] [cursor=pointer]:
+          - generic [ref=e119]:
+            - generic [ref=e121]: 
+            - generic [ref=e122]: ATMs
+      - button "Next page" [ref=e123] [cursor=pointer]:
+        - generic [ref=e124]: 
+    - list [ref=e28]:
+      - listitem [ref=e29]:
+        - button "Menu" [ref=e30] [cursor=pointer]:
+          - generic [ref=e31]: 
+      - listitem [ref=e33]:
+        - button "Saved" [ref=e34] [cursor=pointer]:
+          - generic [ref=e35]: 
+      - listitem [ref=e39]:
+        - button "Recents" [disabled] [ref=e40]:
+          - generic [ref=e41]: 
+      - listitem [ref=e46]:
+        - button "Get app" [ref=e47] [cursor=pointer]:
+          - generic [ref=e48]: 
+    - generic [ref=e128]:
+      - button "Google apps" [ref=e132] [cursor=pointer]
+      - link "Sign in" [ref=e136] [cursor=pointer]:
+        - /url: https://accounts.google.com/ServiceLogin?hl=en&passive=true&continue=https%3A%2F%2Fwww.google.com%2Fmaps%2F%4024.4976969%2C54.4014336%2C15z%3Fhl%3Den%26ved%3D1t%253A314688&service=local&ec=GAZAcQ
+    - generic:
+      - generic:
+        - button "Show Your Location" [ref=e139] [cursor=pointer]:
+          - generic [ref=e141]: 
+        - generic [ref=e143] [cursor=pointer]:
+          - button "Zoom in" [ref=e144]:
+            - generic [ref=e146]: 
+          - button "Zoom out" [ref=e147]:
+            - generic [ref=e149]: 
+      - generic [ref=e154] [cursor=pointer]:
+        - button "Browse Street View images" [ref=e155]
+        - button "Show imagery" [ref=e157]:
+          - generic [ref=e160]: 
+      - generic [ref=e161]:
+        - generic "Interactive map" [ref=e162]
+        - generic [ref=e166] [cursor=pointer]:
+          - generic [ref=e167]: 
+          - generic [ref=e168]: Layers
+        - button "Layers" [ref=e169] [cursor=pointer]
+    - generic [ref=e171]:
+      - contentinfo [ref=e174]:
+        - text: Imagery ©2026 , Map data ©2026 Google
+        - button "United Arab Emirates" [ref=e175] [cursor=pointer]
+        - button "Terms" [ref=e176] [cursor=pointer]
+        - button "Privacy" [ref=e177] [cursor=pointer]
+        - button "Send Product Feedback" [ref=e178] [cursor=pointer]
+      - button "500 m" [ref=e180] [cursor=pointer]

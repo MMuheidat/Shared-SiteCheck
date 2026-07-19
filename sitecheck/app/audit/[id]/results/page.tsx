@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useMemo, useCallback } from 'react';
+import { useEffect, useState, useMemo, useCallback, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import {
@@ -69,6 +69,10 @@ export default function ResultsPage() {
   // Per-pillar running state
   const [runningPillars, setRunningPillars] = useState<Set<string>>(new Set());
 
+  // What run this page initiated — drives the completion toast. null when the
+  // run was started elsewhere (or the page was opened mid-run).
+  const runKindRef = useRef<{ kind: 'pillar'; pillarName: string } | { kind: 'all' } | null>(null);
+
   // Screenshot modal state
   const [screenshotOpen, setScreenshotOpen] = useState(false);
   const [screenshotPath, setScreenshotPath] = useState<string | null>(null);
@@ -80,8 +84,33 @@ export default function ResultsPage() {
       if (!res.ok) {
         throw new Error('Failed to load audit results');
       }
-      const data = await res.json();
+      const data: AuditJob = await res.json();
       setAudit(data);
+
+      // Completion detection for runs started on this page. The engine
+      // deletes a pillar's old rows and reinserts them during a re-run, so
+      // row presence means nothing — the only reliable done signal is the
+      // job status leaving 'running' for a terminal state.
+      const terminal =
+        data.status === 'complete' || data.status === 'partial' || data.status === 'failed';
+      const run = runKindRef.current;
+      if (terminal && run) {
+        if (run.kind === 'pillar') {
+          const pillarResults = data.results?.filter((r) => r.pillar === run.pillarName) ?? [];
+          const earned = pillarResults.reduce((sum, r) => sum + r.scoreEarned, 0);
+          const max = pillarResults.reduce((sum, r) => sum + r.maxScore, 0);
+          showToast(`${run.pillarName}: ${earned}/${max} points`, earned > 0 ? 'success' : 'error');
+        } else {
+          showToast(
+            data.status === 'failed'
+              ? 'Evaluation failed.'
+              : `Evaluation ${data.status === 'complete' ? 'complete' : 'finished (partial)'}! Score: ${data.totalScore}/${data.maxScore}`,
+            data.status === 'failed' ? 'error' : 'success'
+          );
+        }
+        runKindRef.current = null;
+        setRunningPillars(new Set());
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to load results';
       setError(message);
@@ -92,12 +121,14 @@ export default function ResultsPage() {
   }, [id, showToast]);
 
   useEffect(() => {
+    // Fetch-on-mount: all setState calls happen after await, not synchronously.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchAudit();
   }, [fetchAudit]);
 
-  // If the page is opened (or reloaded) while a run is in progress, keep
-  // polling until the job leaves 'running'. The button handlers below poll
-  // for runs started on this page; this effect covers everything else.
+  // Single source of polling truth: whenever the job is running — started
+  // here (the handlers below optimistically flip status to 'running') or
+  // elsewhere — poll until it reaches a terminal state.
   useEffect(() => {
     if (audit?.status !== 'running') return;
     const interval = setInterval(fetchAudit, 5000);
@@ -149,7 +180,6 @@ export default function ResultsPage() {
   }, [audit]);
 
   const handleRunPillar = async (pillarName: string) => {
-    setRunningPillars((prev) => new Set(prev).add(pillarName));
     showToast(`Running ${pillarName}...`, 'info');
 
     try {
@@ -164,66 +194,17 @@ export default function ResultsPage() {
         throw new Error(err.error || 'Failed to start pillar check');
       }
 
-      // Poll for completion (check every 5 seconds). The run-pillar API flips
-      // the job to 'running' before the engine starts, and the engine writes
-      // the final complete/partial status when it finishes — THAT is the
-      // reliable "done" signal. (This pillar's old rows survive in the DB
-      // until the re-run finishes, so their mere presence means nothing.)
-      const pollInterval = setInterval(async () => {
-        try {
-          const statusRes = await fetch(`/api/audit/${id}`, { cache: 'no-store' });
-          if (statusRes.ok) {
-            const data = await statusRes.json();
-            setAudit(data);
-
-            if (data.status === 'complete' || data.status === 'partial' || data.status === 'failed') {
-              const pillarResults = data.results?.filter(
-                (r: { pillar: string }) => r.pillar === pillarName
-              ) ?? [];
-              const earned = pillarResults.reduce(
-                (sum: number, r: { scoreEarned: number }) => sum + r.scoreEarned,
-                0
-              );
-              const max = pillarResults.reduce(
-                (sum: number, r: { maxScore: number }) => sum + r.maxScore,
-                0
-              );
-
-              setRunningPillars((prev) => {
-                const next = new Set(prev);
-                next.delete(pillarName);
-                return next;
-              });
-              clearInterval(pollInterval);
-              showToast(
-                `${pillarName}: ${earned}/${max} points`,
-                earned > 0 ? 'success' : 'error'
-              );
-            }
-          }
-        } catch {
-          // Ignore polling errors
-        }
-      }, 5000);
-
-      // Safety timeout after 3 minutes
-      setTimeout(() => {
-        clearInterval(pollInterval);
-        setRunningPillars((prev) => {
-          const next = new Set(prev);
-          next.delete(pillarName);
-          return next;
-        });
-        fetchAudit(); // Final refresh
-      }, 180000);
+      // Optimistic: engage the status-gated poller immediately and mark the
+      // pillar as running. The completion effect above clears it when the
+      // job's status leaves 'running'. (Safe: the API flips the DB status to
+      // 'running' before responding, so the refresh below can't revert this.)
+      runKindRef.current = { kind: 'pillar', pillarName };
+      setRunningPillars((prev) => new Set(prev).add(pillarName));
+      setAudit((prev) => (prev ? { ...prev, status: 'running' } : prev));
+      fetchAudit(); // immediate refresh — don't wait for the first poll tick
     } catch (err) {
       const message = err instanceof Error ? err.message : 'An error occurred';
       showToast(message, 'error');
-      setRunningPillars((prev) => {
-        const next = new Set(prev);
-        next.delete(pillarName);
-        return next;
-      });
     }
   };
 
@@ -242,37 +223,10 @@ export default function ResultsPage() {
 
       showToast('Running all pillars! This may take a few minutes.', 'success');
       // Mark all production pillars as running (beta pillars are excluded from Run All)
+      runKindRef.current = { kind: 'all' };
       setRunningPillars(new Set(pillars.filter((p) => !p.beta).map((p) => p.name)));
-
-      // Poll for overall completion ('partial' is also terminal — e.g. beta
-      // pillars pending or a pillar left the job incomplete)
-      const pollInterval = setInterval(async () => {
-        try {
-          const statusRes = await fetch(`/api/audit/${id}`, { cache: 'no-store' });
-          if (statusRes.ok) {
-            const data = await statusRes.json();
-            setAudit(data);
-            if (data.status === 'complete' || data.status === 'partial' || data.status === 'failed') {
-              clearInterval(pollInterval);
-              setRunningPillars(new Set());
-              showToast(
-                data.status === 'failed'
-                  ? 'Evaluation failed.'
-                  : `Evaluation ${data.status === 'complete' ? 'complete' : 'finished (partial)'}! Score: ${data.totalScore}/${data.maxScore}`,
-                data.status === 'failed' ? 'error' : 'success'
-              );
-            }
-          }
-        } catch {
-          // Ignore
-        }
-      }, 5000);
-
-      setTimeout(() => {
-        clearInterval(pollInterval);
-        setRunningPillars(new Set());
-        fetchAudit();
-      }, 600000);
+      setAudit((prev) => (prev ? { ...prev, status: 'running' } : prev));
+      fetchAudit();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'An error occurred';
       showToast(message, 'error');
@@ -330,7 +284,10 @@ export default function ResultsPage() {
     );
   }
 
-  const anyRunning = runningPillars.size > 0;
+  // Anything running — started on this page (runningPillars) or elsewhere
+  // (server status from the mount fetch) — disables every Run button so
+  // concurrent Playwright/Chrome runs can't be stacked.
+  const anyRunning = runningPillars.size > 0 || audit.status === 'running';
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -378,7 +335,7 @@ export default function ResultsPage() {
               ) : (
                 <>
                   <PlayCircle className="w-4 h-4" />
-                  Run All Pillars (1–8)
+                  Run All Pillars
                 </>
               )}
             </button>
@@ -460,8 +417,8 @@ export default function ResultsPage() {
                   {/* Run / Re-run button */}
                   <button
                     onClick={() => handleRunPillar(pillar.name)}
-                    disabled={isRunning}
-                    className={`w-full text-xs py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 transition-all duration-200 ${
+                    disabled={anyRunning}
+                    className={`w-full text-xs py-2 px-3 rounded-lg font-medium flex items-center justify-center gap-1.5 transition-all duration-200 disabled:opacity-60 disabled:cursor-not-allowed ${
                       isRunning
                         ? 'bg-primary/10 text-primary cursor-wait'
                         : hasResults
