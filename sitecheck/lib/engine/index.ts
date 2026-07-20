@@ -3,7 +3,7 @@
 
 import path from 'path';
 import fs from 'fs';
-import type { CriterionResult, ProgressEvent } from '@/lib/types';
+import type { CriterionResult, ProgressEvent, PillarCheckFn } from '@/lib/types';
 import { CRITERIA, calculateTotalScore, calculatePillarScores } from '@/lib/scoring';
 import { prisma } from '@/lib/prisma';
 import { startPillarRecording } from '@/lib/engine/recording';
@@ -32,7 +32,7 @@ import pillar10Enquiry from '@/lib/engine/pillar10-enquiry';
 export const PILLAR_CHECKS: Array<{
   name: string;
   nameAR: string;
-  fn: typeof pillar1Discovery;
+  fn: PillarCheckFn;
   beta?: boolean;
   record?: string;
   skipInitialNav?: boolean;
@@ -43,8 +43,8 @@ export const PILLAR_CHECKS: Array<{
   { name: 'Navigation', nameAR: 'التنقل', fn: pillar4Navigation, record: 'pillar4' },
   { name: 'Registration', nameAR: 'التسجيل', fn: pillar5Registration, record: 'pillar5' },
   { name: 'Services', nameAR: 'الخدمات', fn: pillar6Services, beta: true },
-  { name: 'Performance', nameAR: 'الأداء', fn: pillar7Performance },
-  { name: 'Customer Privacy', nameAR: 'خصوصية العملاء', fn: pillar8Privacy },
+  { name: 'Performance', nameAR: 'الأداء', fn: pillar7Performance, record: 'pillar7' },
+  { name: 'Customer Privacy', nameAR: 'خصوصية العملاء', fn: pillar8Privacy, record: 'pillar8' },
   { name: 'Live Chat', nameAR: 'الدردشة المباشرة', fn: pillar9LiveChat, beta: true },
   { name: 'Enquiry Form Journey', nameAR: 'رحلة نموذج الاستفسار', fn: pillar10Enquiry, beta: true },
 ];
@@ -96,9 +96,10 @@ async function executePillar(args: {
   auditJobId: string;
   entityName: string;
   acronym: string;
+  serviceName: string;
   previousResults: CriterionResult[];
 }): Promise<CriterionResult[]> {
-  const { pillar, browser, sharedPage, url, auditJobId, entityName, acronym, previousResults } = args;
+  const { pillar, browser, sharedPage, url, auditJobId, entityName, acronym, serviceName, previousResults } = args;
 
   const recorder = pillar.record
     ? await startPillarRecording(browser, { auditJobId, slug: pillar.record }).catch((err) => {
@@ -130,6 +131,7 @@ async function executePillar(args: {
       auditJobId,
       entityName,
       acronym,
+      serviceName,
       previousResults,
       recorder: recorder ?? undefined,
     });
@@ -156,7 +158,7 @@ export async function runEvaluation(
     where: { id: auditJobId },
   });
 
-  const { websiteUrl: url, entityName, acronym } = auditJob;
+  const { websiteUrl: url, entityName, acronym, serviceName } = auditJob;
   const allResults: CriterionResult[] = [];
   // Run All covers production pillars only — beta pillars (LLM-dependent) are excluded.
   const activePillars = PILLAR_CHECKS.filter((p) => !p.beta);
@@ -242,6 +244,7 @@ export async function runEvaluation(
           auditJobId,
           entityName,
           acronym,
+          serviceName,
           previousResults: allResults,
         });
       } catch (pillarError) {
@@ -399,7 +402,7 @@ export async function runSinglePillar(
     where: { id: auditJobId },
   });
 
-  const { websiteUrl: url, entityName, acronym } = auditJob;
+  const { websiteUrl: url, entityName, acronym, serviceName } = auditJob;
 
   // Create screenshot directory
   const screenshotDir = path.join(process.cwd(), 'public', 'screenshots', auditJobId);
@@ -471,6 +474,7 @@ export async function runSinglePillar(
         auditJobId,
         entityName,
         acronym,
+        serviceName,
         previousResults,
       });
     } catch (pillarError) {

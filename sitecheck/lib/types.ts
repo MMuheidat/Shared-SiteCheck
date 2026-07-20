@@ -40,6 +40,7 @@ export interface AuditJob {
   userId: string;
   websiteUrl: string;
   entityName: string;
+  acronym: string;
   serviceName: string;
   evaluatorLanguage: string;
   deviceType: string;
@@ -74,6 +75,8 @@ export interface PillarScore {
   earned: number;
   max: number;
   percentage: number;
+  /** True for unscored pillars (e.g. Registration): earned/max are pass/ran counts, graded green by pass-rate. */
+  noPoints?: boolean;
 }
 
 // ========== Grade ==========
@@ -87,6 +90,8 @@ export type PillarCheckFn = (params: {
   entityName: string;
   /** Evaluator-supplied entity acronym (Q1b); empty string means auto-derive. */
   acronym: string;
+  /** Evaluator-supplied assessed service name (Q21 search query / Services pillar); empty string means none. */
+  serviceName: string;
   previousResults: CriterionResult[];
   /** Present when the engine records this pillar's run (screen-recording evidence). */
   recorder?: import('./engine/recording').EvidenceRecorder;

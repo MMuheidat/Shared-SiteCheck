@@ -1351,67 +1351,231 @@ async function checkQ8(
 }
 
 // ────────────────────────────────────────────────────────────
-//  Q9 — Screen Reader Compatibility
-//  "Capture a normal page view where the text is selectable and structured...
-//   Highlight the tested content area"
+//  Q9 — Read-aloud / text-to-speech ("read speaker")
+//  Pass ONLY if the site offers a working read-aloud feature: either a
+//  dedicated "Listen"/ReadSpeaker widget button OR a popup that appears above
+//  selected text, AND activating it verifiably starts speech/audio. Absent or
+//  non-functional ⇒ fail. Verified live on camera by installing a
+//  speechSynthesis spy + audio-element watcher before interacting.
 // ────────────────────────────────────────────────────────────
-async function checkQ9(page: Page, auditJobId: string): Promise<CriterionResult> {
-  try {
-    const a11yData = await page.evaluate(() => {
-      const semanticElements = document.querySelectorAll('nav, main, header, footer, article, section, aside').length;
-      const hasLangAttr = !!document.documentElement.lang;
-      const ariaLabels = document.querySelectorAll('[aria-label], [role]').length;
-      return { semanticElements, hasLangAttr, ariaLabels };
-    });
+const READ_ALOUD_SELECTORS = [
+  '[class*="readspeaker" i]', '[id*="readspeaker" i]', '[id^="rs_"]', '[id*="rsbtn" i]',
+  '.rsbtn', '#rsbtn', '[class*="rsbtn" i]',
+  'button[class*="read-aloud" i]', '[class*="read-aloud" i]', '[class*="readaloud" i]',
+  'button[class*="text-to-speech" i]', '[class*="text-to-speech" i]', '[class*="texttospeech" i]',
+  '[class*="tts" i]', '[data-tts]',
+  '[aria-label*="listen" i]', '[title*="listen" i]',
+  '[aria-label*="read aloud" i]', '[title*="read aloud" i]', '[aria-label*="read out loud" i]',
+  '[aria-label*="استمع"]', '[title*="استمع"]', '[aria-label*="اقرأ"]', '[aria-label*="قراءة"]',
+  'button:has-text("Listen")', 'a:has-text("Listen")', 'button:has-text("Read aloud")',
+  'button:has-text("استمع")', 'a:has-text("استمع")',
+];
 
-    const ss = ssPath(auditJobId, '9');
-
-    // Highlight the main content area to prove text is structured,
-    // then take a medium-zoom viewport shot (not full page).
-    await page.evaluate(() => {
-      const main = document.querySelector('main, article, .content, #content') as HTMLElement | null;
-      if (!main) return;
-      main.scrollIntoView({ behavior: 'instant', block: 'start' });
-      main.setAttribute('data-sitecheck-hl', '1');
-      main.style.outline = '4px solid green';
-      main.style.boxShadow = '0 0 15px rgba(0, 255, 0, 0.5)';
-
-      const label = document.createElement('div');
-      label.className = 'sitecheck-p2-label';
-      label.textContent = 'Structured Content Area';
-      label.style.cssText =
-        'position:absolute; background:green; color:white; padding:4px 8px; ' +
-        'font-weight:bold; border-radius:4px; z-index:999999; pointer-events:none;';
-      document.body.appendChild(label);
-
-      const rect = main.getBoundingClientRect();
-      const labelRect = label.getBoundingClientRect();
-      let top = rect.top + window.scrollY - labelRect.height - 8;
-      let left = rect.left + window.scrollX;
-      // The content area is usually taller than the viewport — if there is no
-      // room above it, place the label just INSIDE its top edge (not below the
-      // whole element, which would fall outside the captured viewport).
-      if (rect.top < labelRect.height + 10) top = rect.top + window.scrollY + 8;
-      if (left + labelRect.width > window.scrollX + window.innerWidth) {
-        left = window.scrollX + window.innerWidth - labelRect.width - 8;
+// Install a speech/audio spy in the page. Read-aloud widgets either drive the
+// Web Speech API (speechSynthesis.speak) or stream an <audio> element (e.g.
+// ReadSpeaker). We catch both so a real read-aloud is provable, not assumed.
+async function installTtsSpy(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as unknown as { __scTts?: { spoke: boolean; audio: boolean }; __scTtsPatched?: boolean; __scTtsObs?: MutationObserver };
+    w.__scTts = { spoke: false, audio: false };
+    try {
+      if (window.speechSynthesis && !w.__scTtsPatched) {
+        const orig = window.speechSynthesis.speak.bind(window.speechSynthesis);
+        window.speechSynthesis.speak = (u: SpeechSynthesisUtterance) => { w.__scTts!.spoke = true; return orig(u); };
+        w.__scTtsPatched = true;
       }
-      if (left < window.scrollX) left = window.scrollX + 8;
-      label.style.top = `${top}px`;
-      label.style.left = `${left}px`;
+    } catch { /* speechSynthesis unavailable */ }
+    try {
+      const obs = new MutationObserver((muts) => {
+        for (const m of muts) {
+          for (const node of Array.from(m.addedNodes)) {
+            const el = node as HTMLElement;
+            if (!el || !el.tagName) continue;
+            const tag = el.tagName.toLowerCase();
+            if (tag === 'audio' || tag === 'video') { w.__scTts!.audio = true; continue; }
+            const id = (el.id || '');
+            const cls = typeof el.className === 'string' ? el.className : '';
+            if (/rs(btn|div|_)|readspeaker|rs-player|tts/i.test(id + ' ' + cls)) w.__scTts!.audio = true;
+          }
+        }
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+      w.__scTtsObs = obs;
+    } catch { /* observer unavailable */ }
+  }).catch(() => { /* spy is best-effort */ });
+}
+
+// Read the spy: did speech or audio start?
+async function ttsFired(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const w = window as unknown as { __scTts?: { spoke: boolean; audio: boolean } };
+    const t = w.__scTts || { spoke: false, audio: false };
+    let playing = false;
+    document.querySelectorAll('audio, video').forEach((m) => {
+      const media = m as HTMLMediaElement;
+      if (!media.paused && !media.ended && media.currentTime > 0) playing = true;
+    });
+    const speaking = !!(window.speechSynthesis && (window.speechSynthesis.speaking || window.speechSynthesis.pending));
+    return t.spoke || t.audio || playing || speaking;
+  }).catch(() => false);
+}
+
+async function checkQ9(
+  page: Page, url: string, auditJobId: string, recorder?: EvidenceRecorder,
+): Promise<CriterionResult> {
+  const stampNote = () => (recorder ? ` [${recorder.stamp()}]` : '');
+  const ss = ssPath(auditJobId, '9');
+  try {
+    await recorder?.setCaption('Q9 — Testing read-aloud (text-to-speech)…');
+    await installTtsSpy(page);
+
+    let mode = '';
+    let controlSel: string | null = null;
+
+    // ── 1. Widget mode: a dedicated "Listen"/ReadSpeaker button on the page ──
+    controlSel = await findVisibleControl(page, READ_ALOUD_SELECTORS, { width: 500, height: 220 });
+
+    // If nothing obvious, it may live inside a collapsed accessibility toolbar.
+    let openedWidget = false;
+    if (!controlSel) {
+      const widgetSel = await findVisibleControl(page, A11Y_WIDGET_SELECTORS, { width: 300, height: 300 });
+      if (widgetSel) {
+        const urlBefore = page.url();
+        try {
+          await recorder?.setCaption('Q9 — Opening the accessibility widget to look for read-aloud…');
+          await clickWithHighlight(page.locator(widgetSel).first(), { holdMs: 1000, timeout: 5000 });
+          openedWidget = true;
+          await page.waitForTimeout(1500);
+        } catch { /* widget not clickable */ }
+        if (page.url() !== urlBefore) {
+          await navigateAndWait(page, url, { waitAfter: 2000 });
+          await installTtsSpy(page);
+        } else {
+          controlSel = await findVisibleControl(page, READ_ALOUD_SELECTORS, { width: 500, height: 220 });
+        }
+      }
+    }
+    if (controlSel) mode = 'widget';
+
+    // ── 2. Select-to-speak mode: select body text, watch for a floating button ──
+    if (!controlSel) {
+      await recorder?.setCaption('Q9 — Selecting text to check for a read-aloud popup…');
+      const hasPara = await page.evaluate(() => {
+        const ps = Array.from(document.querySelectorAll('p, article, li'));
+        for (const p of ps) {
+          const t = (p.textContent || '').trim();
+          const r = p.getBoundingClientRect();
+          if (t.length > 80 && r.width > 50 && r.height > 10 && r.top >= 0 && r.top < window.innerHeight) {
+            p.setAttribute('data-sitecheck-tts-p', '1');
+            return true;
+          }
+        }
+        // Fall back to the first substantial paragraph even if below the fold.
+        for (const p of ps) {
+          const t = (p.textContent || '').trim();
+          if (t.length > 80) { p.setAttribute('data-sitecheck-tts-p', '1'); return true; }
+        }
+        return false;
+      }).catch(() => false);
+
+      if (hasPara) {
+        const para = page.locator('[data-sitecheck-tts-p]').first();
+        await para.scrollIntoViewIfNeeded().catch(() => {});
+        await page.waitForTimeout(300);
+        const box = await para.boundingBox().catch(() => null);
+        if (box) {
+          // Real mouse drag — sites bind their select-to-listen popup to mouseup.
+          try {
+            await page.mouse.move(box.x + 6, box.y + Math.min(box.height / 2, 12));
+            await page.mouse.down();
+            await page.mouse.move(box.x + Math.min(box.width - 6, 320), box.y + Math.min(box.height / 2, 12), { steps: 12 });
+            await page.mouse.up();
+          } catch { /* fall back to programmatic selection below */ }
+        }
+        // Guarantee a selection exists and fire a mouseup so listeners react.
+        await page.evaluate(() => {
+          const p = document.querySelector('[data-sitecheck-tts-p]');
+          if (!p) return;
+          try {
+            const range = document.createRange();
+            range.selectNodeContents(p);
+            const sel = window.getSelection();
+            sel?.removeAllRanges();
+            sel?.addRange(range);
+            const r = p.getBoundingClientRect();
+            p.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: r.left + 10, clientY: r.top + 10 }));
+          } catch { /* selection unsupported */ }
+        }).catch(() => {});
+        await page.waitForTimeout(1200);
+
+        controlSel = await findVisibleControl(page, READ_ALOUD_SELECTORS, { width: 320, height: 140 });
+        if (controlSel) mode = 'select-to-speak';
+      }
+    }
+
+    // ── 3. No read-aloud control at all ⇒ fail, narrated on camera ──
+    if (!controlSel) {
+      await recorder?.setCaption('Q9 — No read-aloud (text-to-speech) feature found on this website');
+      if (recorder) await page.waitForTimeout(1500);
+      await viewportShot(page, ss.abs);
+      await page.evaluate(() => document.querySelectorAll('[data-sitecheck-tts-p]').forEach(e => e.removeAttribute('data-sitecheck-tts-p'))).catch(() => {});
+      if (openedWidget) await navigateAndWait(page, url, { waitAfter: 1500 });
+      return makeResult('Q9', {
+        scoreEarned: 0,
+        status: 'fail',
+        screenshotPath: ss.rel,
+        notes: 'No read-aloud / text-to-speech feature found (checked for a Listen/ReadSpeaker widget and for a popup on text selection).' + stampNote(),
+      });
+    }
+
+    // ── 4. Screenshot the control, then click it and verify speech starts ──
+    await takeHighlightedScreenshot(page, ss.abs, [controlSel], {
+      contextualZoom: true,
+      label: mode === 'select-to-speak' ? 'Read-aloud popup' : 'Read-aloud control',
+      maxHighlightBox: { width: 500, height: 220 },
     });
 
-    await page.waitForTimeout(500);
-    await viewportShot(page, ss.abs);
-    await cleanupHighlights(page);
+    await recorder?.setCaption('Q9 — Activating read-aloud and listening for speech…');
+    let functional = false;
+    try {
+      await clickWithHighlight(page.locator(controlSel).first(), { holdMs: 1000, timeout: 5000 });
+      await page.waitForTimeout(1800);
+      functional = await ttsFired(page);
+      if (!functional) {
+        // Some players start on a second control (e.g. a play button in the bar).
+        await page.waitForTimeout(1200);
+        functional = await ttsFired(page);
+      }
+    } catch { /* control not clickable */ }
 
-    const score = (a11yData.hasLangAttr && a11yData.semanticElements >= 2) ? 1 : 0;
+    if (functional && recorder) {
+      await recorder.setCaption('Q9 — Read-aloud is speaking ✓ — verifying the content on camera…');
+      await humanScrollVerify(page, { maxSteps: 2, delayMs: 300 });
+    }
 
+    // Restore: stop any speech, clear the selection, and reload if we navigated.
+    await page.evaluate(() => {
+      try { window.speechSynthesis?.cancel(); } catch { /* */ }
+      try { window.getSelection()?.removeAllRanges(); } catch { /* */ }
+      document.querySelectorAll('[data-sitecheck-tts-p]').forEach(e => e.removeAttribute('data-sitecheck-tts-p'));
+    }).catch(() => {});
+    if (page.url() !== url && !page.url().startsWith(new URL(url).origin)) {
+      await navigateAndWait(page, url, { waitAfter: 1500 });
+    }
+
+    if (functional) {
+      return makeResult('Q9', {
+        scoreEarned: 1,
+        status: 'pass',
+        screenshotPath: ss.rel,
+        notes: `Read-aloud feature found (${mode}) and verified functional — activating it started speech/audio.` + stampNote(),
+      });
+    }
     return makeResult('Q9', {
-      scoreEarned: score,
-      status: score === 1 ? 'pass' : 'fail',
+      scoreEarned: 0,
+      status: 'fail',
       screenshotPath: ss.rel,
-      notes: `Semantic elements: ${a11yData.semanticElements}, ARIA attributes: ${a11yData.ariaLabels}. ` +
-             `Content area highlighted in screenshot.`,
+      notes: `A read-aloud control was found (${mode}) but activating it produced no detectable speech or audio (present but not functional).` + stampNote(),
     });
   } catch (err: unknown) {
     return makeResult('Q9', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
@@ -1619,8 +1783,8 @@ export default async function pillar2Accessibility(params: {
   await recorder?.setCaption('Q7 — Checking that images provide descriptive alt text…');
   results.push(await checkQ7(page, auditJobId, recorder));
   results.push(await checkQ8(page, url, auditJobId, recorder));
-  await recorder?.setCaption('Q9 — Checking screen-reader compatibility (structure & semantics)…');
-  results.push(await checkQ9(page, auditJobId));
+  await recorder?.setCaption('Q9 — Testing read-aloud (text-to-speech)…');
+  results.push(await checkQ9(page, url, auditJobId, recorder));
   results.push(await checkQ10(page, url, auditJobId, recorder));
 
   await recorder?.setCaption('Pillar 2 — Accessibility & Inclusion: checks complete');

@@ -26,6 +26,7 @@ import {
   MessageSquare,
   MailQuestion,
   PlayCircle,
+  Clapperboard,
 } from 'lucide-react';
 import ScoreSummaryCard from '@/components/ScoreSummaryCard';
 import PillarBreakdownChart from '@/components/PillarBreakdownChart';
@@ -33,6 +34,7 @@ import ResultsTable from '@/components/ResultsTable';
 import ScreenshotModal from '@/components/ScreenshotModal';
 import { SkeletonCard, SkeletonTable } from '@/components/Skeleton';
 import { useToast } from '@/components/Toast';
+import { isNoPointsPillar } from '@/lib/scoring';
 import type { AuditJob, PillarScore } from '@/lib/types';
 
 // Icon map for each pillar
@@ -77,6 +79,7 @@ export default function ResultsPage() {
   const [screenshotOpen, setScreenshotOpen] = useState(false);
   const [screenshotPath, setScreenshotPath] = useState<string | null>(null);
   const [screenshotName, setScreenshotName] = useState('');
+  const [videoJourneyLoading, setVideoJourneyLoading] = useState(false);
 
   const fetchAudit = useCallback(async () => {
     try {
@@ -146,33 +149,55 @@ export default function ResultsPage() {
   // Compute pillar scores from results
   const pillarScores: PillarScore[] = useMemo(() => {
     if (!audit?.results) return [];
-    const pillarMap = new Map<string, { earned: number; max: number }>();
+    const pillarMap = new Map<string, { earned: number; max: number; passed: number; ran: number }>();
 
     for (const r of audit.results) {
-      const existing = pillarMap.get(r.pillar) || { earned: 0, max: 0 };
+      const existing = pillarMap.get(r.pillar) || { earned: 0, max: 0, passed: 0, ran: 0 };
       existing.earned += r.scoreEarned;
       existing.max += r.maxScore;
+      // Pass-count tracking for no-points pillars: only questions with a real verdict.
+      if (r.status === 'pass' || r.status === 'fail') {
+        existing.ran += 1;
+        if (r.status === 'pass') existing.passed += 1;
+      }
       pillarMap.set(r.pillar, existing);
     }
 
-    return Array.from(pillarMap.entries()).map(([pillar, data]) => ({
-      pillar,
-      pillarAR: '',
-      earned: data.earned,
-      max: data.max,
-      percentage: data.max > 0 ? (data.earned / data.max) * 100 : 0,
-    }));
+    return Array.from(pillarMap.entries()).map(([pillar, data]) => {
+      if (isNoPointsPillar(pillar)) {
+        // Grade by pass-rate over questions that actually ran (exclude skipped/na).
+        return {
+          pillar,
+          pillarAR: '',
+          earned: data.passed,
+          max: data.ran,
+          percentage: data.ran > 0 ? (data.passed / data.ran) * 100 : 0,
+          noPoints: true,
+        };
+      }
+      return {
+        pillar,
+        pillarAR: '',
+        earned: data.earned,
+        max: data.max,
+        percentage: data.max > 0 ? (data.earned / data.max) * 100 : 0,
+      };
+    });
   }, [audit]);
 
   // Check which pillars have results
   const pillarStatus = useMemo(() => {
-    const status = new Map<string, { earned: number; max: number; count: number }>();
+    const status = new Map<string, { earned: number; max: number; count: number; passed: number; ran: number }>();
     if (audit?.results) {
       for (const r of audit.results) {
-        const existing = status.get(r.pillar) || { earned: 0, max: 0, count: 0 };
+        const existing = status.get(r.pillar) || { earned: 0, max: 0, count: 0, passed: 0, ran: 0 };
         existing.earned += r.scoreEarned;
         existing.max += r.maxScore;
         existing.count++;
+        if (r.status === 'pass' || r.status === 'fail') {
+          existing.ran += 1;
+          if (r.status === 'pass') existing.passed += 1;
+        }
         status.set(r.pillar, existing);
       }
     }
@@ -249,6 +274,33 @@ export default function ResultsPage() {
     showToast('Downloading PDF report...', 'info');
   };
 
+  const handleVideoJourney = async () => {
+    if (videoJourneyLoading) return;
+    setVideoJourneyLoading(true);
+    showToast('Combining pillar videos — this can take a minute…', 'info');
+    try {
+      const res = await fetch(`/api/audit/${id}/video-journey`);
+      if (!res.ok) {
+        const msg = await res.json().catch(() => ({}));
+        throw new Error(msg.error || 'Failed to build the video journey.');
+      }
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = `sitecheck-video-journey-${id}.webm`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(objectUrl);
+      showToast('Video journey downloaded.', 'success');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'An error occurred', 'error');
+    } finally {
+      setVideoJourneyLoading(false);
+    }
+  };
+
   // Loading state
   if (loading) {
     return (
@@ -288,6 +340,7 @@ export default function ResultsPage() {
   // (server status from the mount fetch) — disables every Run button so
   // concurrent Playwright/Chrome runs can't be stacked.
   const anyRunning = runningPillars.size > 0 || audit.status === 'running';
+  const hasVideos = !!audit.results?.some((r) => r.videoPath);
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -339,6 +392,24 @@ export default function ResultsPage() {
                 </>
               )}
             </button>
+            <button
+              onClick={handleVideoJourney}
+              disabled={videoJourneyLoading || !hasVideos || anyRunning}
+              title={hasVideos ? 'Combine all pillar videos into one' : 'Run a recorded pillar (1–5) first'}
+              className="btn-secondary shrink-0"
+            >
+              {videoJourneyLoading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Combining...
+                </>
+              ) : (
+                <>
+                  <Clapperboard className="w-4 h-4" />
+                  Video Journey
+                </>
+              )}
+            </button>
             <button onClick={handleDownloadPdf} className="btn-primary shrink-0">
               <FileDown className="w-4 h-4" />
               Download PDF
@@ -372,9 +443,10 @@ export default function ResultsPage() {
               const status = pillarStatus.get(pillar.name);
               const isRunning = runningPillars.has(pillar.name);
               const hasResults = status && status.count > 0;
-              const percentage = status && status.max > 0
-                ? Math.round((status.earned / status.max) * 100)
-                : null;
+              const noPoints = isNoPointsPillar(pillar.name);
+              const percentage = noPoints
+                ? (status && status.ran > 0 ? Math.round((status.passed / status.ran) * 100) : null)
+                : (status && status.max > 0 ? Math.round((status.earned / status.max) * 100) : null);
 
               return (
                 <div
@@ -402,15 +474,29 @@ export default function ResultsPage() {
                   {/* Score badge */}
                   {hasResults && !isRunning && (
                     <div className="flex items-center gap-2">
-                      {percentage !== null && percentage >= 50 ? (
+                      {noPoints ? (
+                        (status.passed > 0 ? (
+                          <CheckCircle className="w-3.5 h-3.5 text-success shrink-0" />
+                        ) : (
+                          <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
+                        ))
+                      ) : percentage !== null && percentage >= 50 ? (
                         <CheckCircle className="w-3.5 h-3.5 text-success shrink-0" />
                       ) : (
                         <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
                       )}
-                      <span className="text-xs font-medium text-text-secondary">
-                        {status.earned}/{status.max} pts
-                        <span className="text-text-muted ml-1">({percentage}%)</span>
-                      </span>
+                      {noPoints ? (
+                        <span className="text-xs font-medium text-text-secondary">
+                          {status.passed}/{status.ran} tests
+                          {percentage !== null && <span className="text-text-muted ml-1">({percentage}%)</span>}
+                          <span className="text-text-muted ml-1">· no points</span>
+                        </span>
+                      ) : (
+                        <span className="text-xs font-medium text-text-secondary">
+                          {status.earned}/{status.max} pts
+                          <span className="text-text-muted ml-1">({percentage}%)</span>
+                        </span>
+                      )}
                     </div>
                   )}
 

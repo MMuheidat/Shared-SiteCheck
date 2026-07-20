@@ -45,10 +45,20 @@ export default function PillarBreakdownChart({ pillarScores }: PillarBreakdownCh
                 {pillar.pillar}
               </span>
               <div className="flex items-center gap-2 shrink-0">
+                {pillar.noPoints && (
+                  <span className="text-[0.6rem] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200">
+                    No points
+                  </span>
+                )}
                 <span className="text-xs font-semibold text-text-secondary">
                   {pillar.earned}/{pillar.max}
+                  {pillar.noPoints && ' tests'}
                 </span>
-                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${barBg(pillar.percentage)}`}>
+                <span
+                  className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                    pillar.noPoints ? 'bg-emerald-50' : barBg(pillar.percentage)
+                  }`}
+                >
                   {Math.round(pillar.percentage)}%
                 </span>
               </div>
@@ -57,7 +67,9 @@ export default function PillarBreakdownChart({ pillarScores }: PillarBreakdownCh
             {/* Bar */}
             <div className="h-3 bg-surface-darker rounded-full overflow-hidden">
               <div
-                className={`h-full rounded-full bg-gradient-to-r ${barColor(pillar.percentage)} transition-all duration-1000 ease-out`}
+                className={`h-full rounded-full bg-gradient-to-r transition-all duration-1000 ease-out ${
+                  pillar.noPoints ? 'from-emerald-500 to-emerald-400' : barColor(pillar.percentage)
+                }`}
                 style={{
                   width: animated ? `${Math.max(pillar.percentage, 2)}%` : '0%',
                   transitionDelay: `${index * 80}ms`,

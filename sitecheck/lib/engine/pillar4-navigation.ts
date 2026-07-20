@@ -124,6 +124,24 @@ function landedOnSocial(finalUrl: string): boolean {
   return SOCIAL_CORES.some(core => finalUrl.toLowerCase().includes(core));
 }
 
+// A link that reaches the right platform host can still be BROKEN — a deleted
+// profile / removed post keeps the platform core in the URL but renders an
+// error page ("Sorry, this page isn't available"). Detect those by body text
+// so they count as broken even though landedOnSocial() is true. Login/consent
+// walls are intentionally NOT matched here (they are treated as reachable).
+const SOCIAL_ERROR_RX =
+  /(this (?:page|content|account|video) (?:isn'?t|is not|no longer) (?:available|active|exist)|sorry, (?:this|the) page|page not found|content not found|couldn'?t find this page|page (?:doesn'?t|does not) exist|this account (?:doesn'?t|does not) exist|user not found|video (?:isn'?t available|unavailable)|404 not found)/i;
+
+async function socialPageHasError(p: Page): Promise<boolean> {
+  return p
+    .evaluate((rxSrc: string) => {
+      const rx = new RegExp(rxSrc, 'i');
+      const text = (document.body?.innerText || '').slice(0, 4000);
+      return rx.test(text);
+    }, SOCIAL_ERROR_RX.source)
+    .catch(() => false);
+}
+
 /**
  * Find the entity's social profile links (host-matched, share widgets
  * excluded) and tag every matching anchor with data-sitecheck-social so the
@@ -216,6 +234,7 @@ async function checkQ12(
 
     let working = 0;
     const testResults: string[] = [];
+    const brokenReasons: string[] = [];
 
     if (recorder) {
       // On-camera journey: click each link, scroll its page like a human, return.
@@ -224,6 +243,7 @@ async function checkQ12(
         await recorder.setCaption(`Q12 — Opening ${link.platform}…`);
         dbg(`Q12: opening ${link.platform}…`);
         let finalUrl = '';
+        let httpErrored = false;
         try {
           // isVisible() is true for off-canvas drawer links — require real
           // on-canvas coordinates before trying to click like a human, and
@@ -278,31 +298,42 @@ async function checkQ12(
             finalUrl = p.url();
             await p.close().catch(() => {});
             // Replay the visit on the recorded page so it lands on video.
-            await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+            const rr = await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+            if (rr && rr.status() >= 400) httpErrored = true;
             navigatedAway = true;
             if (!landedOnSocial(finalUrl)) finalUrl = page.url();
           } else {
             // Click didn't take us anywhere (or anchor unclickable) — go directly.
-            await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            const rr = await page.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+            if (rr && rr.status() >= 400) httpErrored = true;
             finalUrl = page.url();
             navigatedAway = true;
           }
           page.context().off('page', popupHandler);
 
           await page.waitForTimeout(1500);
-          if (landedOnSocial(finalUrl) || landedOnSocial(page.url())) {
+          const landed = landedOnSocial(finalUrl) || landedOnSocial(page.url());
+          const errorPage = landed && !httpErrored ? await socialPageHasError(page) : false;
+          if (landed && !httpErrored && !errorPage) {
             working++;
             testResults.push(`${link.platform} ✓`);
             dbg(`Q12: ${link.platform} ✓`);
             await recorder.setCaption(`Q12 — ${link.platform} opened ✓ — verifying the page…`);
             await humanScrollVerify(page, { maxSteps: 2, delayMs: 300 });
           } else {
-            testResults.push(`${link.platform} ✗ (landed on ${finalUrl.slice(0, 60)})`);
-            dbg(`Q12: ${link.platform} ✗ (landed on ${finalUrl.slice(0, 60)})`);
+            const reason = !landed
+              ? `redirected off-platform (${finalUrl.slice(0, 60)})`
+              : httpErrored
+                ? 'server returned an error (HTTP ≥ 400)'
+                : 'platform error / page-not-found';
+            brokenReasons.push(`${link.platform}: ${reason}`);
+            testResults.push(`${link.platform} ✗ (${reason})`);
+            dbg(`Q12: ${link.platform} ✗ (${reason})`);
             await recorder.setCaption(`Q12 — ${link.platform} did not open correctly ✗`);
             await page.waitForTimeout(1200);
           }
         } catch {
+          brokenReasons.push(`${link.platform}: failed to load`);
           testResults.push(`${link.platform} ✗ (failed to load)`);
           dbg(`Q12: ${link.platform} ✗ (failed to load)`);
         }
@@ -324,15 +355,25 @@ async function checkQ12(
       for (const link of toVisit) {
         const socialPage = await page.context().newPage();
         try {
-          await socialPage.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          const rr = await socialPage.goto(link.href, { waitUntil: 'domcontentloaded', timeout: 20000 });
           await socialPage.waitForTimeout(1500);
-          if (landedOnSocial(socialPage.url())) {
+          const landed = landedOnSocial(socialPage.url());
+          const httpErrored = !!rr && rr.status() >= 400;
+          const errorPage = landed && !httpErrored ? await socialPageHasError(socialPage) : false;
+          if (landed && !httpErrored && !errorPage) {
             working++;
             testResults.push(`${link.platform} ✓`);
           } else {
-            testResults.push(`${link.platform} ✗ (redirected to ${socialPage.url().slice(0, 60)})`);
+            const reason = !landed
+              ? `redirected to ${socialPage.url().slice(0, 60)}`
+              : httpErrored
+                ? 'server returned an error (HTTP ≥ 400)'
+                : 'platform error / page-not-found';
+            brokenReasons.push(`${link.platform}: ${reason}`);
+            testResults.push(`${link.platform} ✗ (${reason})`);
           }
         } catch {
+          brokenReasons.push(`${link.platform}: failed to load`);
           testResults.push(`${link.platform} ✗ (failed to load)`);
         } finally {
           await socialPage.close().catch(() => null);
@@ -341,9 +382,14 @@ async function checkQ12(
     }
 
     const tested = toVisit.length;
+    const broken = tested - working;
     const platforms = found.map(d => d.platform).join(', ');
     const stampNote = recorder ? ` [${recorder.stamp()}]` : '';
-    if (working === tested) {
+    const brokenNote = brokenReasons.length ? ` Broken: ${brokenReasons.join('; ')}.` : '';
+
+    // 3-tier scoring: all links working → 2/2; exactly one broken → 1/2;
+    // more than one broken → 0/2 fail.
+    if (broken === 0) {
       return makeResult('Q12', {
         scoreEarned: 2,
         status: 'pass',
@@ -352,11 +398,21 @@ async function checkQ12(
         recommendation: '',
       });
     }
+    if (broken === 1) {
+      return makeResult('Q12', {
+        scoreEarned: 1,
+        status: 'partial',
+        screenshotPath: ss.rel,
+        notes: `Social media links present but 1 of ${tested} did not work.${brokenNote} Platforms: ${platforms}.${capNote}${burgerNote} Tested: ${testResults.join(', ')}.${stampNote}`,
+        recommendation: 'Fix or remove the broken social media link so every listed profile is reachable.',
+      });
+    }
     return makeResult('Q12', {
-      scoreEarned: 1,
-      status: 'partial',
+      scoreEarned: 0,
+      status: 'fail',
       screenshotPath: ss.rel,
-      notes: `Social media links present but ${tested - working} of ${tested} could not be verified as functional. Platforms: ${platforms}.${capNote}${burgerNote} Tested: ${testResults.join(', ')}.${stampNote}`,
+      notes: `Social media links present but ${broken} of ${tested} did not work (more than one broken).${brokenNote} Platforms: ${platforms}.${capNote}${burgerNote} Tested: ${testResults.join(', ')}.${stampNote}`,
+      recommendation: 'Fix or remove the broken social media links so every listed profile is reachable.',
     });
   } catch (err: unknown) {
     return makeResult('Q12', { notes: `Error: ${err instanceof Error ? err.message : String(err)}` });
@@ -1395,7 +1451,7 @@ async function checkQ20(
 //  Performs a real search and opens the first result to verify it works.
 // ────────────────────────────────────────────────────────────
 async function checkQ21(
-  page: Page, url: string, auditJobId: string, hasSearch: boolean,
+  page: Page, url: string, auditJobId: string, hasSearch: boolean, serviceName?: string,
 ): Promise<CriterionResult> {
   if (!hasSearch) {
     return makeResult('Q21', { status: 'skipped', notes: 'Skipped — no search bar found (Q13).' });
@@ -1404,7 +1460,12 @@ async function checkQ21(
     const isArabic = await page.evaluate(
       () => /[؀-ۿ]/.test(document.body.innerText.substring(0, 2000))
     );
-    const query = isArabic ? 'خدمات' : 'services';
+    // Prefer the evaluator-supplied assessed service name (from the new-audit form);
+    // fall back to a generic "services" query when none was provided.
+    const svc = (serviceName || '').trim();
+    const query = svc || (isArabic ? 'خدمات' : 'services');
+    const usedServiceName = svc.length > 0;
+    dbg(`Q21: searching for "${query}"${usedServiceName ? ' (evaluator service name)' : ' (default query)'}`);
 
     const INPUT_SELECTORS = [
       'input[type="search"]', 'input[role="searchbox"]',
@@ -1498,6 +1559,7 @@ async function checkQ21(
     await viewportShot(page, ss.abs);
 
     const hasResults = !results.noResults && results.resultLinks.length > 0;
+    const queryNote = usedServiceName ? ' (query = assessed service name from audit setup)' : '';
 
     if (!hasResults) {
       await navigateAndWait(page, url);
@@ -1505,7 +1567,7 @@ async function checkQ21(
         scoreEarned: 0,
         status: 'fail',
         screenshotPath: ss.rel,
-        notes: `Searched for "${query}" but no results were shown${results.noResults ? ' (explicit no-results message)' : ''}.`,
+        notes: `Searched for "${query}"${queryNote} but no results were shown${results.noResults ? ' (explicit no-results message)' : ''}.`,
       });
     }
 
@@ -1524,7 +1586,7 @@ async function checkQ21(
         scoreEarned: 2,
         status: 'pass',
         screenshotPath: ss.rel,
-        notes: `Search for "${query}" returned ${results.resultLinks.length}+ relevant results and the first result page loads correctly.${results.mentionsQuery ? '' : ' (Note: result text did not explicitly contain the query term.)'}`,
+        notes: `Search for "${query}"${queryNote} returned ${results.resultLinks.length}+ relevant results and the first result page loads correctly.${results.mentionsQuery ? '' : ' (Note: result text did not explicitly contain the query term.)'}`,
         recommendation: '',
       });
     }
@@ -1532,7 +1594,7 @@ async function checkQ21(
       scoreEarned: 1,
       status: 'partial',
       screenshotPath: ss.rel,
-      notes: `Search for "${query}" returned results, but the first result page failed to load or was empty.`,
+      notes: `Search for "${query}"${queryNote} returned results, but the first result page failed to load or was empty.`,
     });
   } catch (err: unknown) {
     await navigateAndWait(page, url).catch(() => {});
@@ -1877,10 +1939,11 @@ export default async function pillar4Navigation(params: {
   url: string;
   auditJobId: string;
   entityName: string;
+  serviceName: string;
   previousResults: CriterionResult[];
   recorder?: EvidenceRecorder;
 }): Promise<CriterionResult[]> {
-  const { page, url, auditJobId, entityName, recorder } = params;
+  const { page, url, auditJobId, entityName, serviceName, recorder } = params;
   const results: CriterionResult[] = [];
 
   dbg(`starting Navigation pillar for "${entityName}" (${url})${recorder ? ' — recording' : ''}`);
@@ -1907,7 +1970,7 @@ export default async function pillar4Navigation(params: {
 
   // Q21 and Q30 navigate away from the homepage — run them last
   await recorder?.setCaption('Q21 — Testing the search with a real query…');
-  results.push(await checkQ21(page, url, auditJobId, q13.hasSearch));
+  results.push(await checkQ21(page, url, auditJobId, q13.hasSearch, serviceName));
   await recorder?.setCaption('Q30 — Testing browser back/forward navigation…');
   results.push(await checkQ30(page, url, auditJobId));
 

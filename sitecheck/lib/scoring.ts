@@ -1438,6 +1438,16 @@ export function getRecommendation(qid: string): string {
   return criterion?.recommendation ?? '';
 }
 
+/**
+ * A "no-points" pillar is one whose every criterion is unscored (maxScore
+ * contributes nothing to the audit total) — currently only Registration.
+ * These are graded by pass-count instead of points in the results UI.
+ */
+export function isNoPointsPillar(pillarName: string): boolean {
+  const criteria = CRITERIA.filter((c) => c.pillar === pillarName);
+  return criteria.length > 0 && criteria.every((c) => !c.isScored);
+}
+
 export function calculateTotalScore(results: CriterionResult[]): {
   total: number;
   max: number;
